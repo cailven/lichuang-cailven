@@ -22,6 +22,9 @@
 
 #include <esp_netif.h>
 
+#include <map>
+#include <utility>
+
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
@@ -164,6 +167,8 @@ private:
     ScriptGameApp* script_app_ = nullptr;  // 脚本游戏宿主 (复用, 每次加载不同脚本)
     GameApp* active_game_ = nullptr;       // 当前打开的游戏 (全部为脚本游戏)
     lv_timer_t* auto_desktop_timer_ = nullptr;
+    // 脚本元信息缓存: 名字 → {文件大小, meta}; 桌面扫描时跳过未变化的脚本
+    std::map<std::string, std::pair<size_t, ScriptAppMeta>> script_meta_cache_;
 
     // 打开一个游戏 (原生或脚本), 处理"游戏里切游戏"的情况
     void OpenGame(GameApp* game) {
@@ -306,18 +311,29 @@ private:
         launcher_->SetStatusProvider([this]() { return ComposeStatusText(); });
 
         // 脚本游戏: 每次进桌面扫描 /apps, 图标 = 标题首字 + 脚本指定颜色
+        // 元信息 (标题/颜色) 按 名字+文件大小 缓存, 没变化的脚本跳过 Lua 编译
         launcher_->SetDynamicAppsProvider([this]() {
             std::vector<DesktopLauncher::AppEntry> entries;
             if (!ScriptStorage::IsMounted()) {
                 return entries;
             }
             for (const auto& n : ScriptStorage::ListApps()) {
-                std::string src;
-                ScriptAppMeta meta;
-                meta.title = n;
-                if (ScriptStorage::ReadApp(n, src)) {
-                    ScriptGameApp::PeekMeta(src, meta);
+                size_t size = 0;
+                if (!ScriptStorage::GetAppSize(n, size)) {
+                    continue;
                 }
+                auto cached = script_meta_cache_.find(n);
+                if (cached == script_meta_cache_.end() || cached->second.first != size) {
+                    std::string src;
+                    ScriptAppMeta meta;
+                    meta.title = n;
+                    if (ScriptStorage::ReadApp(n, src)) {
+                        ScriptGameApp::PeekMeta(src, meta);
+                    }
+                    script_meta_cache_[n] = {size, meta};
+                    cached = script_meta_cache_.find(n);
+                }
+                const ScriptAppMeta& meta = cached->second.second;
                 DesktopLauncher::AppEntry e;
                 e.title_zh = meta.title;  // 中文标题 (字体就绪后显示)
                 e.title_en = n;           // 字体未就绪时回退显示文件名

@@ -20,6 +20,8 @@ public:
     static bool ReadApp(const std::string& name, std::string& out);
     static bool WriteApp(const std::string& name, const std::string& content);
     static bool DeleteApp(const std::string& name);
+    // 取脚本文件大小 (桌面元信息缓存用, 未找到返回 false)
+    static bool GetAppSize(const std::string& name, size_t& size);
 
     // 名字只允许字母/数字/下划线/连字符/中文以外的安全字符, 防 path 注入
     static bool IsValidName(const std::string& name);

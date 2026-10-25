@@ -129,3 +129,15 @@ bool ScriptStorage::DeleteApp(const std::string& name) {
     }
     return remove(PathOf(name).c_str()) == 0;
 }
+
+bool ScriptStorage::GetAppSize(const std::string& name, size_t& size) {
+    if (!mounted_ || !IsValidName(name)) {
+        return false;
+    }
+    struct stat st;
+    if (stat(PathOf(name).c_str(), &st) != 0) {
+        return false;
+    }
+    size = (size_t)st.st_size;
+    return true;
+}

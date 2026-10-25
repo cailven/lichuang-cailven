@@ -208,6 +208,7 @@ bool AppUploadServer::Start() {
     }
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 8080;
+    config.stack_size = 16384;  // 上传校验要在本任务跑 Lua 编译器, 默认 4K 会栈溢出
     config.max_uri_handlers = 8;
     config.lru_purge_enable = true;
     config.uri_match_fn = httpd_uri_match_wildcard;  // 支持 /app/* 通配删除路径
