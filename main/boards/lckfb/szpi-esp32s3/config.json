@@ -6,7 +6,9 @@
         {
             "name": "lichuang-dev",
             "sdkconfig_append": [
-                "CONFIG_USE_DEVICE_AEC=y"
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_PARTITION_TABLE_CUSTOM_FILENAME=\"partitions/v2/16m_games.csv\"",
+                "CONFIG_FATFS_LFN_HEAP=y"
             ]
         }
     ]

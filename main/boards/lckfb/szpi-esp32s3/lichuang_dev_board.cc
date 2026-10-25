@@ -14,6 +14,12 @@
 #include "game_launcher.h"
 #include "snake_game.h"
 #include "game_ui_common.h"
+#include "script_game.h"
+#include "script_storage.h"
+#include "app_upload_server.h"
+#include "demo_lua_game.h"
+
+#include <esp_netif.h>
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -113,14 +119,43 @@ private:
     lv_obj_t* home_btn_ = nullptr;
     lv_obj_t* home_icon_ = nullptr;
 
-    // ===== 应用桌面 + 游戏 (一期) =====
+    // ===== 应用桌面 + 游戏 (一期原生 / 二期 Lua 脚本) =====
     // 三种界面模式: 小智聊天 (小智原生 UI) / 应用桌面 / 游戏
     enum class UiMode { kChat, kDesktop, kGame };
     UiMode ui_mode_ = UiMode::kChat;
     lv_obj_t* chat_screen_ = nullptr;  // 小智原生聊天屏幕 (首次切屏前捕获)
     DesktopLauncher* launcher_ = nullptr;
     SnakeGame* snake_ = nullptr;
+    ScriptGameApp* script_app_ = nullptr;  // 脚本游戏宿主 (复用, 每次加载不同脚本)
+    GameApp* active_game_ = nullptr;       // 当前打开的游戏 (原生或脚本)
     lv_timer_t* auto_desktop_timer_ = nullptr;
+
+    // 打开一个游戏 (原生或脚本), 处理"游戏里切游戏"的情况
+    void OpenGame(GameApp* game) {
+        if (game == nullptr) {
+            return;
+        }
+        if (ui_mode_ == UiMode::kGame) {
+            if (active_game_ == game) {
+                return;
+            }
+            if (active_game_ != nullptr) {
+                active_game_->Exit();
+            }
+            active_game_ = game;
+            game->Enter();
+            return;
+        }
+        active_game_ = game;
+        SetUiMode(UiMode::kGame);
+    }
+
+    // 打开一个脚本游戏 (先加载脚本与元信息)
+    void OpenScriptGame(const std::string& name) {
+        if (script_app_ != nullptr && script_app_->Load(name)) {
+            OpenGame(script_app_);
+        }
+    }
 
     void SetUiMode(UiMode mode) {
         if (mode == ui_mode_) {
@@ -136,8 +171,8 @@ private:
         }
         switch (mode) {
             case UiMode::kChat:
-                if (snake_ != nullptr) {
-                    snake_->Exit();
+                if (active_game_ != nullptr) {
+                    active_game_->Exit();
                 }
                 if (launcher_ != nullptr) {
                     launcher_->Hide();
@@ -157,8 +192,8 @@ private:
                 lv_screen_load(chat_screen_);
                 break;
             case UiMode::kDesktop:
-                if (snake_ != nullptr) {
-                    snake_->Exit();
+                if (active_game_ != nullptr) {
+                    active_game_->Exit();
                 }
                 if (home_btn_ != nullptr) {
                     lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
@@ -172,7 +207,7 @@ private:
                 if (home_btn_ != nullptr) {
                     lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
                 }
-                snake_->Enter();
+                active_game_->Enter();
                 break;
         }
         ui_mode_ = mode;
@@ -231,12 +266,34 @@ private:
         snake_entry.title_en = "Snake";
         snake_entry.symbol = MATERIAL_SYMBOLS_SPORTS_ESPORTS;
         snake_entry.color = 0x43A047;
-        snake_entry.on_open = [this]() { SetUiMode(UiMode::kGame); };
+        snake_entry.on_open = [this]() { OpenGame(snake_); };
         launcher_->AddApp(snake_entry);
 
         launcher_->SetStatusProvider([this]() { return ComposeStatusText(); });
 
-        snake_ = new SnakeGame(display_, [this]() { SetUiMode(UiMode::kDesktop); });
+        // 脚本游戏: 每次进桌面扫描 /apps, 图标 = 标题首字 + 脚本指定颜色
+        launcher_->SetDynamicAppsProvider([this]() {
+            std::vector<DesktopLauncher::AppEntry> entries;
+            if (!ScriptStorage::IsMounted()) {
+                return entries;
+            }
+            for (const auto& n : ScriptStorage::ListApps()) {
+                std::string src;
+                ScriptAppMeta meta;
+                meta.title = n;
+                if (ScriptStorage::ReadApp(n, src)) {
+                    ScriptGameApp::PeekMeta(src, meta);
+                }
+                DesktopLauncher::AppEntry e;
+                e.title_zh = meta.title;  // 中文标题 (字体就绪后显示)
+                e.title_en = n;           // 字体未就绪时回退显示文件名
+                e.symbol = "";            // 空图标 → 图标块显示标题首字
+                e.color = meta.color;
+                e.on_open = [this, n]() { OpenScriptGame(n); };
+                entries.push_back(std::move(e));
+            }
+            return entries;
+        });
 
         // 小智就绪 (连上服务器进入 idle) 后自动进入应用桌面
         if (lvgl_port_lock(1000)) {
@@ -246,13 +303,31 @@ private:
                     if (self != nullptr &&
                         Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
                         lv_timer_pause(timer);  // 只自动进一次
+                        // 网络已就绪, 启动游戏上传服务 (构造期启动会在 lwip 初始化前崩)
+                        AppUploadServer::Start();
                         self->SetUiMode(UiMode::kDesktop);
                     }
                 },
                 500, this);
             lvgl_port_unlock();
         }
-        ESP_LOGI(TAG, "App launcher ready (xiaozhi + snake)");
+        ESP_LOGI(TAG, "App launcher ready (xiaozhi + snake + scripts)");
+    }
+
+    // 脚本游戏平台: 存储挂载 + 出厂演示 + Lua 自检 + 上传服务
+    void InitializeScriptPlatform() {
+        if (ScriptStorage::Mount()) {
+            if (ScriptStorage::ListApps().empty()) {
+                ScriptStorage::WriteApp("demo_catch", kDemoLuaGame);
+                ESP_LOGI(TAG, "Seeded demo game 'demo_catch'");
+            }
+            ScriptGameApp::SelfTest();
+        } else {
+            ESP_LOGW(TAG, "Script storage unavailable, script games disabled");
+        }
+        script_app_ = new ScriptGameApp(display_, [this]() { SetUiMode(UiMode::kDesktop); });
+        // 上传服务不能在这里启动: 板级构造时 lwip 还没初始化 (tcpip mbox 断言),
+        // 推迟到网络就绪 (auto_desktop_timer 首次进入 idle 时) 再启动
     }
 
     void InitializeI2c() {
@@ -484,7 +559,7 @@ private:
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
 
-        // 语音控制桌面/游戏: "打开贪吃蛇" / "回到桌面" / "打开小智"
+        // 语音控制桌面/游戏: "打开贪吃蛇" / "回到桌面" / "怎么装游戏"
         mcp_server.AddTool("self.launcher.show",
             "Show the app launcher (desktop) on the screen, where the user can open apps like the AI chat or games.",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
@@ -494,7 +569,7 @@ private:
         mcp_server.AddTool("self.snake.start",
             "Start the built-in snake game on the screen. The user controls the snake by swiping on the touchscreen.",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                SetUiMode(UiMode::kGame);
+                OpenGame(snake_);
                 return true;
             });
         mcp_server.AddTool("self.snake.stop",
@@ -502,6 +577,21 @@ private:
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
                 SetUiMode(UiMode::kDesktop);
                 return true;
+            });
+        mcp_server.AddTool("self.apps.install_info",
+            "Tell the user how to install new Lua script games over WiFi.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+                if (netif == nullptr) {
+                    return "WiFi 未连接";
+                }
+                esp_netif_ip_info_t ip;
+                if (esp_netif_get_ip_info(netif, &ip) != ESP_OK) {
+                    return "无法获取 IP";
+                }
+                char buf[64];
+                esp_ip4addr_ntoa(&ip.ip, buf, sizeof(buf));
+                return std::string("用手机或电脑连接同一 WiFi, 浏览器打开 http://") + buf + ":8080 即可上传 lua 游戏脚本";
             });
     }
 
@@ -773,7 +863,9 @@ public:
         InitializeButtons();
         InitializeCamera();
         InitializeTools();
+        InitializeScriptPlatform();
         InitializeAppUi();
+        snake_ = new SnakeGame(display_, [this]() { SetUiMode(UiMode::kDesktop); });
         battery_ = new BatteryDevice(i2c_bus_, 0x55);
         InitializeBattery();
 
