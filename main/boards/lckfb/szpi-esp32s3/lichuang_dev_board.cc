@@ -17,6 +17,7 @@
 #include "script_storage.h"
 #include "script_hw.h"
 #include "app_upload_server.h"
+#include "settings_panel.h"
 #include "demo_lua_game.h"
 #include "snake_lua_game.h"
 
@@ -162,13 +163,14 @@ private:
 
     // ===== 应用桌面 + 游戏 (一期原生 / 二期 Lua 脚本) =====
     // 三种界面模式: 小智聊天 (小智原生 UI) / 应用桌面 / 游戏
-    enum class UiMode { kChat, kDesktop, kGame };
+    enum class UiMode { kChat, kDesktop, kGame, kSettings };
     UiMode ui_mode_ = UiMode::kChat;
     lv_obj_t* chat_screen_ = nullptr;  // 小智原生聊天屏幕 (首次切屏前捕获)
     DesktopLauncher* launcher_ = nullptr;
     ScriptGameApp* script_app_ = nullptr;  // 脚本游戏宿主 (复用, 每次加载不同脚本)
     GameApp* active_game_ = nullptr;       // 当前打开的游戏 (全部为脚本游戏)
     lv_timer_t* auto_desktop_timer_ = nullptr;
+    SettingsPanel* settings_panel_ = nullptr;
     // 脚本元信息缓存: 名字 → {文件大小, meta}; 桌面扫描时跳过未变化的脚本
     std::map<std::string, std::pair<size_t, ScriptAppMeta>> script_meta_cache_;
 
@@ -274,6 +276,16 @@ private:
                 QuietXiaozhi();  // 桌面模式: 小智静默
                 launcher_->Show();
                 break;
+            case UiMode::kSettings:
+                if (active_game_ != nullptr) {
+                    active_game_->Exit();
+                }
+                if (home_btn_ != nullptr) {
+                    lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
+                }
+                QuietXiaozhi();
+                settings_panel_->Show();
+                break;
             case UiMode::kGame:
                 if (launcher_ != nullptr) {
                     launcher_->Hide();
@@ -335,6 +347,38 @@ private:
         xiaozhi_entry.color = 0x1E88E5;
         xiaozhi_entry.on_open = [this]() { SetUiMode(UiMode::kChat); };
         launcher_->AddApp(xiaozhi_entry);
+
+        DesktopLauncher::AppEntry settings_entry;
+        settings_entry.title_zh = "设置";
+        settings_entry.title_en = "Settings";
+        settings_entry.symbol = MATERIAL_SYMBOLS_SETTINGS;
+        settings_entry.color = 0x546E7A;
+        settings_entry.on_open = [this]() { SetUiMode(UiMode::kSettings); };
+        launcher_->AddApp(settings_entry);
+
+        SettingsPanel::Callbacks cb;
+        cb.get_brightness = [this]() { return (int)GetBacklight()->brightness(); };
+        cb.set_brightness = [this](int v) { GetBacklight()->SetBrightness(v, true); };
+        cb.get_volume = [this]() { return GetAudioCodec()->output_volume(); };
+        cb.set_volume = [this](int v) { GetAudioCodec()->SetOutputVolume(v); };
+        cb.enter_wifi_config = [this]() { EnterWifiConfigMode(); };
+        cb.reboot = [this]() { Application::GetInstance().Reboot(); };
+        cb.info = [this]() {
+            esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            char ip[16] = "no ip";
+            if (netif != nullptr) {
+                esp_netif_ip_info_t ipinfo;
+                if (esp_netif_get_ip_info(netif, &ipinfo) == ESP_OK) {
+                    esp_ip4addr_ntoa(&ipinfo.ip, ip, sizeof(ip));
+                }
+            }
+            char buf[80];
+            snprintf(buf, sizeof(buf), "v99.0.0  IP:%s  SRAM:%uK", ip,
+                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+            return std::string(buf);
+        };
+        settings_panel_ = new SettingsPanel(display_, std::move(cb),
+                                            [this]() { SetUiMode(UiMode::kDesktop); });
 
         launcher_->SetStatusProvider([this]() { return ComposeStatusText(); });
 
@@ -465,8 +509,8 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
-            // 桌面/游戏模式下 BOOT 逐级返回: 游戏 → 桌面 → 小智聊天
-            if (ui_mode_ == UiMode::kGame) {
+            // 非聊天模式下 BOOT 逐级返回: 游戏/设置 → 桌面 → 小智聊天
+            if (ui_mode_ == UiMode::kGame || ui_mode_ == UiMode::kSettings) {
                 SetUiMode(UiMode::kDesktop);
                 return;
             }
