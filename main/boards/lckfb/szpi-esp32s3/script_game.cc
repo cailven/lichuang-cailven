@@ -3,6 +3,9 @@
 #include "game_ui_common.h"
 #include "script_storage.h"
 
+#include <cctype>
+#include <cstdlib>
+
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_random.h>
@@ -118,6 +121,10 @@ void ScriptGameApp::RegisterApi(lua_State* L) {
     lua_setfield(L, -2, "millis");
     lua_pushcfunction(L, LuaTime);
     lua_setfield(L, -2, "time");
+    lua_pushcfunction(L, LuaSave);
+    lua_setfield(L, -2, "save");
+    lua_pushcfunction(L, LuaLoad);
+    lua_setfield(L, -2, "load");
     lua_setglobal(L, "game");
 
     // 宿主指针挂到注册表
@@ -223,6 +230,109 @@ int ScriptGameApp::LuaTime(lua_State* L) {
     lua_pushinteger(L, tm_local.tm_mon + 1);
     lua_pushinteger(L, tm_local.tm_mday);
     return 6;
+}
+
+// ===== 最高分/数值持久化: /apps/.scores (键值对文本, 沙箱唯一可写文件) =====
+static const char* kScoreFile = "/apps/.scores";
+
+static bool ScoreKeyOk(const char* key) {
+    size_t n = strlen(key);
+    if (n == 0 || n > 31) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char c = key[i];
+        if (!isalnum((unsigned char)c) && c != '_' && c != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ReadScoreFile(std::string& out) {
+    FILE* f = fopen(kScoreFile, "rb");
+    if (f == nullptr) {
+        out.clear();
+        return true;
+    }
+    out.clear();
+    char buf[512];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0 && out.size() < 4096) {
+        out.append(buf, n);
+    }
+    fclose(f);
+    return true;
+}
+
+int ScriptGameApp::LuaSave(lua_State* L) {
+    const char* key = luaL_checkstring(L, 1);
+    lua_Integer val = luaL_checkinteger(L, 2);
+    if (!ScriptStorage::IsMounted() || !ScoreKeyOk(key)) {
+        luaL_error(L, "game.save: bad key or storage");
+        return 0;
+    }
+    std::string data;
+    ReadScoreFile(data);
+    // 重建文件内容: 替换同名键或追加
+    std::string out;
+    std::string keyeq = std::string(key) + "=";
+    size_t pos = 0;
+    bool written = false;
+    while (pos < data.size()) {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) {
+            eol = data.size();
+        }
+        std::string line = data.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.compare(0, keyeq.size(), keyeq) == 0) {
+            if (!written) {
+                out += keyeq + std::to_string(val) + "\n";
+                written = true;
+            }
+        } else if (!line.empty()) {
+            out += line + "\n";
+        }
+    }
+    if (!written) {
+        out += keyeq + std::to_string(val) + "\n";
+    }
+    FILE* f = fopen(kScoreFile, "wb");
+    if (f == nullptr) {
+        luaL_error(L, "game.save: cannot write");
+        return 0;
+    }
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+    return 0;
+}
+
+int ScriptGameApp::LuaLoad(lua_State* L) {
+    const char* key = luaL_checkstring(L, 1);
+    lua_Integer def = luaL_optinteger(L, 2, 0);
+    if (!ScriptStorage::IsMounted() || !ScoreKeyOk(key)) {
+        lua_pushinteger(L, def);
+        return 1;
+    }
+    std::string data;
+    ReadScoreFile(data);
+    std::string keyeq = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos < data.size()) {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) {
+            eol = data.size();
+        }
+        std::string line = data.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.compare(0, keyeq.size(), keyeq) == 0) {
+            lua_pushinteger(L, (lua_Integer)strtol(line.c_str() + keyeq.size(), nullptr, 10));
+            return 1;
+        }
+    }
+    lua_pushinteger(L, def);
+    return 1;
 }
 
 int ScriptGameApp::LuaPrint(lua_State* L) {

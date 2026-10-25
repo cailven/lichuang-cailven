@@ -45,6 +45,7 @@ static const char* kPage =
     "game.set_tick_period(ms)  game.exit()  game.time()\n"
     "game.random(n)  game.millis()  print(s)\n"
     "game.time() 返回 h,m,s,年,月,日 (联网校时)\n"
+    "game.save(key,n)  game.load(key,默认值)  最高分持久化\n"
     "on_start()  on_tick()  on_touch(evt,x,y)  -- evt: down/move/up\n"
     "标准库: string table math | 画布 320x200 | 颜色 0xRRGGBB\n"
     "中文需等字体推送后显示, 回桌面图标即时刷新</pre></div>"

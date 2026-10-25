@@ -12,12 +12,12 @@
 #include "lvgl_theme.h"
 #include "settings.h"
 #include "game_launcher.h"
-#include "snake_game.h"
 #include "game_ui_common.h"
 #include "script_game.h"
 #include "script_storage.h"
 #include "app_upload_server.h"
 #include "demo_lua_game.h"
+#include "snake_lua_game.h"
 
 #include <esp_netif.h>
 
@@ -125,9 +125,8 @@ private:
     UiMode ui_mode_ = UiMode::kChat;
     lv_obj_t* chat_screen_ = nullptr;  // 小智原生聊天屏幕 (首次切屏前捕获)
     DesktopLauncher* launcher_ = nullptr;
-    SnakeGame* snake_ = nullptr;
     ScriptGameApp* script_app_ = nullptr;  // 脚本游戏宿主 (复用, 每次加载不同脚本)
-    GameApp* active_game_ = nullptr;       // 当前打开的游戏 (原生或脚本)
+    GameApp* active_game_ = nullptr;       // 当前打开的游戏 (全部为脚本游戏)
     lv_timer_t* auto_desktop_timer_ = nullptr;
 
     // 打开一个游戏 (原生或脚本), 处理"游戏里切游戏"的情况
@@ -159,6 +158,13 @@ private:
 
     void SetUiMode(UiMode mode) {
         if (mode == ui_mode_) {
+            return;
+        }
+        // 启动阶段 (未连上服务器) 锁定聊天界面: 触摸屏上电初始化时可能产生
+        // 幽灵触摸 (曾打中"主页"按钮导致桌面在初始化中途切屏 → 崩溃),
+        // 自动进桌面的定时器本身会等 idle, 不受此守卫影响
+        if (mode != UiMode::kChat &&
+            Application::GetInstance().GetDeviceState() == kDeviceStateStarting) {
             return;
         }
         DisplayLockGuard lock(display_);
@@ -261,14 +267,6 @@ private:
         xiaozhi_entry.on_open = [this]() { SetUiMode(UiMode::kChat); };
         launcher_->AddApp(xiaozhi_entry);
 
-        DesktopLauncher::AppEntry snake_entry;
-        snake_entry.title_zh = "贪吃蛇";
-        snake_entry.title_en = "Snake";
-        snake_entry.symbol = MATERIAL_SYMBOLS_SPORTS_ESPORTS;
-        snake_entry.color = 0x43A047;
-        snake_entry.on_open = [this]() { OpenGame(snake_); };
-        launcher_->AddApp(snake_entry);
-
         launcher_->SetStatusProvider([this]() { return ComposeStatusText(); });
 
         // 脚本游戏: 每次进桌面扫描 /apps, 图标 = 标题首字 + 脚本指定颜色
@@ -331,6 +329,11 @@ private:
             if (ScriptStorage::ListApps().empty()) {
                 ScriptStorage::WriteApp("demo_catch", kDemoLuaGame);
                 ESP_LOGI(TAG, "Seeded demo game 'demo_catch'");
+            }
+            std::string existing;
+            if (!ScriptStorage::ReadApp("snake", existing)) {
+                ScriptStorage::WriteApp("snake", kSnakeLuaGame);
+                ESP_LOGI(TAG, "Seeded lua snake game");
             }
             ScriptGameApp::SelfTest();
         } else {
@@ -580,8 +583,12 @@ private:
         mcp_server.AddTool("self.snake.start",
             "Start the built-in snake game on the screen. The user controls the snake by swiping on the touchscreen.",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                OpenGame(snake_);
-                return true;
+                std::string src;
+                if (ScriptStorage::IsMounted() && ScriptStorage::ReadApp("snake", src)) {
+                    OpenScriptGame("snake");
+                    return true;
+                }
+                return "贪吃蛇未安装, 可在安装页上传 snake.lua";
             });
         mcp_server.AddTool("self.snake.stop",
             "Exit the current game and show the app launcher.",
@@ -876,7 +883,6 @@ public:
         InitializeTools();
         InitializeScriptPlatform();
         InitializeAppUi();
-        snake_ = new SnakeGame(display_, [this]() { SetUiMode(UiMode::kDesktop); });
         battery_ = new BatteryDevice(i2c_bus_, 0x55);
         InitializeBattery();
 
