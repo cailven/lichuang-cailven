@@ -1,6 +1,6 @@
 # 立创·实战派 ESP32-S3 (lichuang-dev) 小智固件定制 — 交接文档
 
-> **文档目的**: 本文档记录 2026-10-24 对小智固件的定制开发全过程, 供后续开发者或 AI 助手接手。
+> **文档目的**: 本文档记录实战派小智定制固件的开发全过程与踩坑实录 (2026-10-24 ~ 10-25), 供后续开发者或 AI 助手接手。
 > **接手须知**: 先读 §2 硬件档案和 §2.4 危险操作清单 (避免烧板/断电事故), 再读 §4 代码改造。
 > 源码位置: `~/esp/xiaozhi-esp32` (78/xiaozhi-esp32, main 分支 @ v2.5.3 + 本地修改, 与上游的差异用 `git diff` 查看)。
 
@@ -14,7 +14,7 @@
 | 主控 | ESP32-S3-WROOM-1-N16R8 (16MB Quad Flash + 8MB Octal PSRAM, **IO35/36/37 被 PSRAM 占用不可用**) |
 | 板上固件 | 小智 AI (xiaozhi) v2.5.3 定制版, 基于 ESP-IDF v6.0.2 编译 |
 | 原厂固件 | xiaozhi v2.4.2 (IDF v6.0.2), 完整备份在 `~/esp/backups/xiaozhi_esp32s3_2026-10-24/` |
-| 已完成改造 | ① 触屏手势调亮度/音量 ② 电池电量显示 (英集芯 IP5xx 驱动) |
+| 已完成改造 | ① 触屏手势 ② 电池显示 ③ 应用桌面+Lua 脚本游戏引擎 (详见 §8) |
 | 串口 | `/dev/cu.usbmodem114301` (ESP32-S3 原生 USB-Serial/JTAG, 复位/烧录/日志三合一) |
 | WiFi | NVS 中存有 SSID 配置(已脱敏), 烧录应用分区不会丢失 |
 
@@ -224,12 +224,45 @@ esptool --port /dev/cu.usbmodem114301 --baud 921600 \
 
 ## 8. 当前状态与后续方向
 
-**当前固件状态** (2026-10-24 验证): v2.5.3 + 触控手势 + 电池显示, 稳定运行, WiFi 自动重连, 电量 100% (4214mV) 显示正常, 充电状态识别正常。
+**当前固件状态** (2026-10-25 验证): v2.5.3 + 触控手势 + 电池显示 + **应用桌面/贪吃蛇 (一期)**, 稳定运行。
+
+### 8.1 应用桌面 + 贪吃蛇 (2026-10-25, "类安卓"一期)
+
+文件 (均在板级目录, CMake 自动 glob 编译):
+- `game_framework.h` — GameApp 游戏基类 (name/Enter/Exit/running, 约定持显示锁调用)
+- `game_ui_common.h` — **必用工具**: SafeThemeFont (防字体悬挂, §4.4 模式)、FontHasGlyphs/PickText (内置字体只含小智 UI 汉字子集, "智/贪/吃/蛇"等字要等服务器推送全量字体, 缺字时自动回退英文)、Rgb565
+- `game_launcher.cc/h` — DesktopLauncher: 独立 LVGL screen, AppEntry 注册表 (标题/图标符号/颜色/回调), 状态栏 (设备状态+电池, 1s 定时器), 底部提示
+- `snake_game.cc/h` — 贪吃蛇: 16x10 格 20px/格, PSRAM 手写 RGB565 画布缓冲 (lv_canvas), lv_timer 游戏循环, 滑动转向 (PRESSING 重锚定实现不抬手连续变向, 每步只接受一次转向+禁 180°), 最高分持久化 Settings("snake","best")
+- `lichuang_dev_board.cc` — UiMode 三态调度 (kChat/kDesktop/kGame): 首次切屏前捕获 `chat_screen_=lv_screen_active()`; **手势捕获层只在 kChat 显示** (桌面/游戏要触摸穿透); BOOT 键 (构造参数 long_press_time=800): 启动中=配网(原版)/游戏中=回桌面/桌面=回小智/聊天短按=原版行为/**聊天长按 800ms=回桌面 (按住说话模式下禁用防误触)**; 聊天界面右上角 44x44 半透明"主页"悬浮按钮 (layer_top 手势层之上, 仅 kChat 显示, 图标字体显示前重取); MCP 工具 `self.launcher.show`/`self.snake.start`/`self.snake.stop` (语音"打开贪吃蛇"/"回到桌面"); 500ms lv_timer 轮询 kDeviceStateIdle 自动进桌面 (只一次)
+
+已知项: ① Snake::Exit 未启动时也打日志 (无害噪音); ② 低电量弹窗挂在聊天屏上, 桌面/游戏中不可见; ③ 内置字体的中文缺失字 (服务器推字体后自动变中文)
 
 后续可做的方向 (硬件均已就绪):
+- **二期**: 嵌入 Lua 游戏运行时 (参考 esp-claw 的 lua_modules/lvgl/lcd/touch, LVGL 同为 9.5.x; IDF 版本差 5.5.4→6.0.2 需验证) + 局域网网页上传脚本 → 不烧录装新游戏
+- **三期**: 微信通道 (esp-claw cap_im_wechat 直连 ilinkai.weixin.qq.com 扫码, 但依赖 claw 事件框架难单独搬; 或自建服务端中转); 或 ota_1 刷 ESP-Claw 双系统 (esp_ota_set_boot_partition)
 - 摄像头: 加触屏快门 (拍照 MCP 工具已有, 缺 UI 入口)
 - IMU (QMI8658 @ 0x6A): 翻转屏幕方向、体感交互 (官方例程 `maker-community/lcsc-shizhanpi-esp32s3-examples` 的 02-attitude 有驱动参考)
 - 唤醒词更换: `build.py --wake-word` 参数 (jarvis 等模型可选)
 - PCA9557 bit3~7 空闲输入脚: 可接充电指示灯等外部信号
 - 自建小智服务端 (xiaozhi-esp32-server) 或接入 OpenClaw 桥接, 摆脱官方云
 - ESP-Claw 移植 (源码已克隆到 `~/esp/esp-claw`, 无实战派板级支持, 需按 `application/edge_agent/boards/` 的 YAML 格式写板级配置, 音频可参考 esp_box_3)
+
+### 8.4 二期: Lua 脚本游戏引擎 (2026-10-25, 已烧板验证)
+
+**交付**: 脚本游戏 (Lua 5.5) + 4MB FATFS 存储 + 局域网网页安装 (板上 :8080) → **不烧录装新游戏**。桌面每次显示扫描 /apps 动态出图标 (3 apps: 小智/贪吃蛇/接星星)。镜像 2.84MB (剩 31%)。
+
+- **文件**: script_storage (FATFS 挂载 /apps), script_game (沙箱宿主+API 绑定), app_upload_server (HTTP :8080), demo_lua_game.h (接星星), 16m_games.csv (分区表: assets 8M→4M + storage 4M @0xC00000)
+- **沙箱**: 只开 base/string/table/math; Lua 内存 PSRAM 限额 512KB (自定义分配器); 指令钩子 5M 防死循环; 全 pcall 隔离
+- **脚本 API**: `app={title,color}` + `canvas.fill/rect/text` (0xRRGGBB) + `game.set_tick_period/exit/random/millis` + 回调 `on_start/on_tick/on_touch(evt,x,y)`; 文字走 lv_canvas layer + lv_draw_label(3参数)
+- **踩坑** (都 costly): ① espressif/lua 头文件**无 extern "C"**, C++ 里必须手动包; ② Lua 5.5 的 `lua_newstate` 多了第三参 `seed`; 组件按 `-DLUA_32BITS` 编译 (lua_Integer=int32); ③ **httpd 不能在板级构造期启动** —— lwip 未初始化, tcpip mbox 断言 → 启动循环 (无 panic 输出, 表现为静默循环); 推迟到 kDeviceStateIdle 再启; ④ 分区表改动要同步改 sdkconfig 缓存 (defaults 不覆盖已有值, 必要时删 sdkconfig 全量重配)
+- **网络故障根因复盘 (2026-10-25, 已修复)**: 局域网 ping 板子 100% 丢包、Mac 连不上 :8080, 一度误判为路由器 AP 隔离 (华为 AX3 主网络其实没有隔离开关, 且华为路由器**没有网页后台**, 只能用智慧生活 App 管理, 路由器管理地址打不开是正常的)。真因: **Application 在 idle 时把 WiFi 切到 LOW_POWER = WIFI_PS_MAX_MODEM** (wifi_station.cc SetPowerSaveLevel), 华为路由器对深睡设备的来向单播直接丢弃; 对话时临时升档所以语音正常。修复: 板级覆写 SetPowerSaveLevel 把 LOW_POWER 钳制到 BALANCED (MIN_MODEM), 实测 ping 40-200ms、安装页全流程 (上传/列表/删除) 通过。另: esp_http_server 通配路径要配 `config.uri_match_fn = httpd_uri_match_wildcard`
+
+### 8.5 烧录连接故障排查 (2026-10-25 实录)
+
+esptool 反复 "No serial data received" (default-reset/usb-reset 均无效, 复位脉冲也收不到启动日志, 但 macOS 侧端口可打开): 原生 USB-Serial/JTAG 数据通路卡死 (疑似电脑休眠唤醒后)。**解决: 拔插 USB 线即可恢复**。另外注意: 启动阶段 (kDeviceStateStarting) 按 BOOT 会进配网模式 (原版行为), 观察日志时别碰按键。
+
+### 8.3 版本防护与代码托管 (2026-10-25)
+
+- **OTA 防护**: 官方服务器启动时会比对版本并**自动 OTA** (`application.cc CheckNewVersion` → `UpgradeFirmware`, 还有 force=1 强推通道)。已把根 CMakeLists.txt 的 `PROJECT_VER` 抬到 **99.0.0**, 日志验证 "Current is the latest version"。每次 merge 上游后该行必冲突 (上游会改版本号), 解决时保留 99.0.0。
+- **代码托管**: 定制已提交到 `github.com/cailven/lichuang-cailven` (main 分支, 完整上游历史 + 定制 commit)。本地仓库 `origin` = 上游 (fetch 用, 走 gh-proxy 只读代理), `cailven` = 用户仓库 (push 用, **走 SSH**: 专用密钥 `~/.ssh/id_ed25519_github_cailven`, ssh config 已为 github.com 指定该密钥 + IdentitiesOnly; 用户账号级添加, `ssh -T` 显示 Hi cailven!。HTTPS 备用通道: ghfast.top 透传认证 — gh-proxy.com 会剥掉写路径认证 — 仓库留有调 `gh auth token` 的 credential helper, gh 登录账号 zhangrunqiu 对 cailven 仓库有 ADMIN 权限)。
+- **同步上游流程**: `git fetch origin` → 看 log → `git merge origin/main` → 解决冲突 (预计仅 lichuang_dev_board.cc / config.h / CMakeLists.txt ×2) → 重编译烧录回归。2026-10-25 曾因**浅克隆**推送失败 (index-pack), 已 `git fetch --unshallow` 补全历史。
