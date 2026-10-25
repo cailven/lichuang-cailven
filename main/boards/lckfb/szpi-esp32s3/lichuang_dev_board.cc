@@ -9,6 +9,11 @@
 #include "esp32_camera.h"
 #include "mcp_server.h"
 #include "press_to_talk_mcp_tool.h"
+#include "lvgl_theme.h"
+#include "settings.h"
+#include "game_launcher.h"
+#include "snake_game.h"
+#include "game_ui_common.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -17,6 +22,9 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <material_symbols.h>
+#include <cstdio>
+#include <cstring>
 
 #define TAG "LichuangDevBoard"
 
@@ -31,6 +39,21 @@ public:
         uint8_t data = ReadReg(0x01);
         data = (data & ~(1 << bit)) | (level << bit);
         WriteReg(0x01, data);
+    }
+
+    uint8_t ReadInputPort() {
+        return ReadReg(0x00);
+    }
+};
+
+// 电池模块 I2C 接口 (英集芯 IP5xx 电源SOC, 地址 0x55)
+class BatteryDevice : public I2cDevice {
+public:
+    BatteryDevice(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {}
+
+    // 带错误处理的单字节读取 (运行时轮询用, 避免 ESP_ERROR_CHECK 硬重启)
+    esp_err_t ReadRegSafe(uint8_t reg, uint8_t* val) {
+        return i2c_master_transmit_receive(i2c_device_, &reg, 1, val, 1, 100);
     }
 };
 
@@ -68,6 +91,169 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+
+    // 电池监测 (英集芯 IP5xx @ I2C 0x55)
+    BatteryDevice* battery_ = nullptr;
+    int battery_last_log_level_ = -1;
+
+    // 触摸手势调节亮度/音量
+    lv_obj_t* gesture_layer_ = nullptr;
+    lv_obj_t* indicator_ = nullptr;
+    lv_obj_t* indicator_icon_ = nullptr;
+    lv_obj_t* indicator_bar_ = nullptr;
+    lv_obj_t* indicator_value_ = nullptr;
+    lv_timer_t* indicator_hide_timer_ = nullptr;
+    lv_point_t gesture_start_point_{};
+    bool gesture_decided_ = false;
+    bool gesture_is_brightness_ = false;
+    int gesture_start_value_ = 0;
+    int gesture_last_value_ = 0;
+
+    // 聊天界面右上角"回桌面"悬浮按钮 (挂 layer_top, 手势层之上, 仅聊天模式显示)
+    lv_obj_t* home_btn_ = nullptr;
+    lv_obj_t* home_icon_ = nullptr;
+
+    // ===== 应用桌面 + 游戏 (一期) =====
+    // 三种界面模式: 小智聊天 (小智原生 UI) / 应用桌面 / 游戏
+    enum class UiMode { kChat, kDesktop, kGame };
+    UiMode ui_mode_ = UiMode::kChat;
+    lv_obj_t* chat_screen_ = nullptr;  // 小智原生聊天屏幕 (首次切屏前捕获)
+    DesktopLauncher* launcher_ = nullptr;
+    SnakeGame* snake_ = nullptr;
+    lv_timer_t* auto_desktop_timer_ = nullptr;
+
+    void SetUiMode(UiMode mode) {
+        if (mode == ui_mode_) {
+            return;
+        }
+        DisplayLockGuard lock(display_);
+        if (chat_screen_ == nullptr) {
+            chat_screen_ = lv_screen_active();  // 小智聊天界面建在默认屏幕上
+        }
+        // 手势捕获层只在聊天界面启用 (桌面/游戏的触摸要穿透给自己的界面)
+        if (mode != UiMode::kChat && gesture_layer_ != nullptr) {
+            lv_obj_add_flag(gesture_layer_, LV_OBJ_FLAG_HIDDEN);
+        }
+        switch (mode) {
+            case UiMode::kChat:
+                if (snake_ != nullptr) {
+                    snake_->Exit();
+                }
+                if (launcher_ != nullptr) {
+                    launcher_->Hide();
+                }
+                if (gesture_layer_ != nullptr) {
+                    lv_obj_remove_flag(gesture_layer_, LV_OBJ_FLAG_HIDDEN);
+                }
+                // 聊天模式显示"回桌面"按钮; 字体可能被服务端替换, 显示前重取
+                if (home_btn_ != nullptr) {
+                    const lv_font_t* icon_font =
+                        SafeThemeFont(display_ != nullptr ? display_->GetTheme() : nullptr, true);
+                    if (icon_font != nullptr && home_icon_ != nullptr) {
+                        lv_obj_set_style_text_font(home_icon_, icon_font, 0);
+                    }
+                    lv_obj_remove_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
+                }
+                lv_screen_load(chat_screen_);
+                break;
+            case UiMode::kDesktop:
+                if (snake_ != nullptr) {
+                    snake_->Exit();
+                }
+                if (home_btn_ != nullptr) {
+                    lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
+                }
+                launcher_->Show();
+                break;
+            case UiMode::kGame:
+                if (launcher_ != nullptr) {
+                    launcher_->Hide();
+                }
+                if (home_btn_ != nullptr) {
+                    lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
+                }
+                snake_->Enter();
+                break;
+        }
+        ui_mode_ = mode;
+    }
+
+    // 桌面状态栏文本: 小智设备状态 + 电池
+    std::string ComposeStatusText() {
+        const char* state = "offline";
+        switch (Application::GetInstance().GetDeviceState()) {
+            case kDeviceStateIdle:
+                state = "idle";
+                break;
+            case kDeviceStateListening:
+                state = "listening";
+                break;
+            case kDeviceStateSpeaking:
+                state = "speaking";
+                break;
+            case kDeviceStateConnecting:
+            case kDeviceStateActivating:
+                state = "connecting";
+                break;
+            case kDeviceStateUpgrading:
+                state = "upgrading";
+                break;
+            case kDeviceStateWifiConfiguring:
+                state = "wifi setup";
+                break;
+            default:
+                break;
+        }
+        std::string text = std::string("AI: ") + state;
+        int level = 0;
+        bool charging = false;
+        bool discharging = false;
+        if (GetBatteryLevel(level, charging, discharging)) {
+            char battery[28];
+            snprintf(battery, sizeof(battery), "  |  %d%%%s", level, charging ? " +" : "");
+            text += battery;
+        }
+        return text;
+    }
+
+    void InitializeAppUi() {
+        launcher_ = new DesktopLauncher(display_);
+        DesktopLauncher::AppEntry xiaozhi_entry;
+        xiaozhi_entry.title_zh = "小智";
+        xiaozhi_entry.title_en = "AI Chat";
+        xiaozhi_entry.symbol = MATERIAL_SYMBOLS_CHAT_BUBBLE;
+        xiaozhi_entry.color = 0x1E88E5;
+        xiaozhi_entry.on_open = [this]() { SetUiMode(UiMode::kChat); };
+        launcher_->AddApp(xiaozhi_entry);
+
+        DesktopLauncher::AppEntry snake_entry;
+        snake_entry.title_zh = "贪吃蛇";
+        snake_entry.title_en = "Snake";
+        snake_entry.symbol = MATERIAL_SYMBOLS_SPORTS_ESPORTS;
+        snake_entry.color = 0x43A047;
+        snake_entry.on_open = [this]() { SetUiMode(UiMode::kGame); };
+        launcher_->AddApp(snake_entry);
+
+        launcher_->SetStatusProvider([this]() { return ComposeStatusText(); });
+
+        snake_ = new SnakeGame(display_, [this]() { SetUiMode(UiMode::kDesktop); });
+
+        // 小智就绪 (连上服务器进入 idle) 后自动进入应用桌面
+        if (lvgl_port_lock(1000)) {
+            auto_desktop_timer_ = lv_timer_create(
+                [](lv_timer_t* timer) {
+                    auto* self = static_cast<LichuangDevBoard*>(lv_timer_get_user_data(timer));
+                    if (self != nullptr &&
+                        Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                        lv_timer_pause(timer);  // 只自动进一次
+                        self->SetUiMode(UiMode::kDesktop);
+                    }
+                },
+                500, this);
+            lvgl_port_unlock();
+        }
+        ESP_LOGI(TAG, "App launcher ready (xiaozhi + snake)");
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -108,6 +294,15 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            // 桌面/游戏模式下 BOOT 逐级返回: 游戏 → 桌面 → 小智聊天
+            if (ui_mode_ == UiMode::kGame) {
+                SetUiMode(UiMode::kDesktop);
+                return;
+            }
+            if (ui_mode_ == UiMode::kDesktop) {
+                SetUiMode(UiMode::kChat);
+                return;
+            }
             // In press-to-talk mode the click event is handled by press down/up
             if (!press_to_talk_tool_ || !press_to_talk_tool_->IsPressToTalkEnabled()) {
                 app.ToggleChatState();
@@ -133,6 +328,17 @@ private:
             }
         });
 #endif
+
+        // 聊天界面长按 BOOT 返回桌面; 按住说话模式下禁用 (长按是说话本身, 不能误触)
+        boot_button_.OnLongPress([this]() {
+            if (ui_mode_ != UiMode::kChat) {
+                return;
+            }
+            if (press_to_talk_tool_ && press_to_talk_tool_->IsPressToTalkEnabled()) {
+                return;
+            }
+            SetUiMode(UiMode::kDesktop);
+        });
     }
 
     void InitializeSt7789Display() {
@@ -277,17 +483,299 @@ private:
         // Allow switching between press-to-talk (长按说话) and click-to-talk (单击唤醒)
         press_to_talk_tool_ = new PressToTalkMcpTool();
         press_to_talk_tool_->Initialize();
+
+        // 语音控制桌面/游戏: "打开贪吃蛇" / "回到桌面" / "打开小智"
+        mcp_server.AddTool("self.launcher.show",
+            "Show the app launcher (desktop) on the screen, where the user can open apps like the AI chat or games.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                SetUiMode(UiMode::kDesktop);
+                return true;
+            });
+        mcp_server.AddTool("self.snake.start",
+            "Start the built-in snake game on the screen. The user controls the snake by swiping on the touchscreen.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                SetUiMode(UiMode::kGame);
+                return true;
+            });
+        mcp_server.AddTool("self.snake.stop",
+            "Exit the current game and show the app launcher.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                SetUiMode(UiMode::kDesktop);
+                return true;
+            });
+    }
+
+    void InitializeBattery() {
+        // 电池模块: 英集芯 IP5xx 电源SOC (I2C 0x55)。
+        // 已实测验证: 0xA2/A3 为电池电压 ADC, 公式 2600 + raw*0.26855 (mV);
+        // 0x71 bits[7:5] 为充电状态 (0=未充电, 1=涓流, 2=恒流, 3=恒压, 5=充满)。
+        uint16_t mv = 0;
+        if (ReadBatteryVoltage(mv) && mv > 2500 && mv < 4500) {
+            ESP_LOGI(TAG, "Battery module (IP5xx @0x55) detected: %d mV", mv);
+        } else {
+            ESP_LOGW(TAG, "Battery module at 0x55 not responding, battery display disabled");
+        }
+    }
+
+    bool ReadBatteryVoltage(uint16_t& mv) {
+        if (battery_ == nullptr) {
+            return false;
+        }
+        uint8_t lo = 0, hi = 0;
+        if (battery_->ReadRegSafe(0xA2, &lo) != ESP_OK) return false;
+        if (battery_->ReadRegSafe(0xA3, &hi) != ESP_OK) return false;
+        if (hi & 0x20) {
+            return false;  // 负值不会出现在电池电压上, 视为无效
+        }
+        uint16_t raw = lo + (uint16_t)(hi & 0x3F) * 256;
+        mv = (uint16_t)(2600.0f + raw * 0.26855f);
+        return true;
+    }
+
+    bool ReadBatteryCharging(bool& charging, bool& full) {
+        if (battery_ == nullptr) {
+            return false;
+        }
+        uint8_t status = 0;
+        if (battery_->ReadRegSafe(0x71, &status) != ESP_OK) {
+            return false;
+        }
+        uint8_t state = (status >> 5) & 0x07;
+        charging = (state >= 1 && state <= 3);  // 涓流/恒流/恒压
+        full = (state == 5);
+        return true;
+    }
+
+    // 锂电池开路电压 → 电量百分比 (分段线性, 参考 IP5108 驱动的经验曲线)
+    static int SocFromVoltage(uint16_t mv) {
+        static const struct {
+            uint16_t mv;
+            uint8_t soc;
+        } curve[] = {
+            {3000, 0},  {3300, 3},  {3500, 6},  {3610, 10}, {3650, 13}, {3690, 17},
+            {3710, 20}, {3730, 25}, {3750, 30}, {3770, 35}, {3790, 40}, {3800, 45},
+            {3820, 50}, {3840, 55}, {3850, 60}, {3870, 65}, {3910, 70}, {3950, 75},
+            {3980, 80}, {4020, 85}, {4080, 90}, {4110, 95}, {4200, 100},
+        };
+        if (mv <= curve[0].mv) {
+            return curve[0].soc;
+        }
+        for (size_t i = 1; i < sizeof(curve) / sizeof(curve[0]); i++) {
+            if (mv <= curve[i].mv) {
+                return curve[i - 1].soc +
+                       (int)(mv - curve[i - 1].mv) * (curve[i].soc - curve[i - 1].soc) /
+                           (curve[i].mv - curve[i - 1].mv);
+            }
+        }
+        return 100;
+    }
+
+    void InitializeTouchGestures() {
+        if (!lvgl_port_lock(1000)) {
+            ESP_LOGE(TAG, "Failed to lock LVGL, touch gestures disabled");
+            return;
+        }
+
+        // 从显示主题取字体, 取不到时退回 LVGL 默认字体
+        const lv_font_t* text_font = lv_font_get_default();
+        const lv_font_t* icon_font = lv_font_get_default();
+        if (display_ != nullptr && display_->GetTheme() != nullptr) {
+            auto theme = static_cast<LvglTheme*>(display_->GetTheme());
+            if (theme->text_font() != nullptr && theme->text_font()->font() != nullptr) {
+                text_font = theme->text_font()->font();
+            }
+            if (theme->icon_font() != nullptr && theme->icon_font()->font() != nullptr) {
+                icon_font = theme->icon_font()->font();
+            }
+        }
+
+        // 全屏透明捕获层: 左半屏竖直拖动调亮度, 右半屏调音量
+        gesture_layer_ = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(gesture_layer_);
+        lv_obj_set_size(gesture_layer_, LV_PCT(100), LV_PCT(100));
+        lv_obj_add_flag(gesture_layer_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(gesture_layer_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(gesture_layer_, GestureEventCb, LV_EVENT_ALL, this);
+
+        // 拖动过程中短暂显示的调节指示条 (图标 + 进度条 + 数值)
+        indicator_ = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(indicator_);
+        lv_obj_set_size(indicator_, 212, 40);
+        lv_obj_set_style_bg_color(indicator_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(indicator_, LV_OPA_70, 0);
+        lv_obj_set_style_radius(indicator_, 20, 0);
+        lv_obj_align(indicator_, LV_ALIGN_TOP_MID, 0, 40);
+        lv_obj_set_flex_flow(indicator_, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(indicator_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_hor(indicator_, 14, 0);
+        lv_obj_set_style_pad_ver(indicator_, 0, 0);
+        lv_obj_set_style_pad_column(indicator_, 10, 0);
+        lv_obj_add_flag(indicator_, LV_OBJ_FLAG_HIDDEN);
+
+        indicator_icon_ = lv_label_create(indicator_);
+        lv_obj_set_style_text_font(indicator_icon_, icon_font, 0);
+        lv_obj_set_style_text_color(indicator_icon_, lv_color_white(), 0);
+        lv_label_set_text(indicator_icon_, MATERIAL_SYMBOLS_BRIGHTNESS_6);
+
+        indicator_bar_ = lv_bar_create(indicator_);
+        lv_obj_set_size(indicator_bar_, 100, 10);
+        lv_obj_set_style_radius(indicator_bar_, 5, LV_PART_MAIN);
+        lv_obj_set_style_radius(indicator_bar_, 5, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(indicator_bar_, lv_color_white(), LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(indicator_bar_, LV_OPA_30, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(indicator_bar_, lv_color_hex(0xFFB300), LV_PART_INDICATOR);
+        lv_bar_set_range(indicator_bar_, 0, 100);
+
+        indicator_value_ = lv_label_create(indicator_);
+        lv_obj_set_style_text_font(indicator_value_, text_font, 0);
+        lv_obj_set_style_text_color(indicator_value_, lv_color_white(), 0);
+        lv_label_set_text(indicator_value_, "0");
+
+        indicator_hide_timer_ = lv_timer_create(
+            [](lv_timer_t* timer) {
+                auto* self = static_cast<LichuangDevBoard*>(lv_timer_get_user_data(timer));
+                if (self->indicator_ != nullptr) {
+                    lv_obj_add_flag(self->indicator_, LV_OBJ_FLAG_HIDDEN);
+                }
+                lv_timer_pause(timer);
+            },
+            1200, this);
+        lv_timer_pause(indicator_hide_timer_);
+
+        // 聊天界面的"回桌面"按钮: 创建在手势捕获层之后, 位于其上, 44x44 圆形半透明
+        home_btn_ = lv_obj_create(lv_layer_top());
+        lv_obj_set_size(home_btn_, 44, 44);
+        lv_obj_align(home_btn_, LV_ALIGN_TOP_RIGHT, -8, 40);
+        lv_obj_set_style_radius(home_btn_, 22, 0);
+        lv_obj_set_style_bg_color(home_btn_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(home_btn_, LV_OPA_60, 0);
+        lv_obj_set_style_border_width(home_btn_, 0, 0);
+        lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(home_btn_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(
+            home_btn_,
+            [](lv_event_t* e) {
+                if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+                    return;
+                }
+                auto* self = static_cast<LichuangDevBoard*>(lv_event_get_user_data(e));
+                self->SetUiMode(UiMode::kDesktop);
+            },
+            LV_EVENT_CLICKED, this);
+
+        home_icon_ = lv_label_create(home_btn_);
+        lv_obj_center(home_icon_);
+        lv_obj_set_style_text_color(home_icon_, lv_color_white(), 0);
+        lv_obj_set_style_text_font(home_icon_, icon_font, 0);
+        lv_label_set_text(home_icon_, MATERIAL_SYMBOLS_HOME);
+
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "Touch gestures ready: left half = brightness, right half = volume");
+    }
+
+    void ShowAdjustIndicator(bool brightness, int value) {
+        if (indicator_ == nullptr) {
+            return;
+        }
+        // 主题文本字体可能在运行时被服务端推送的字体替换(SetTextFont 会释放旧字体对象),
+        // 标签样式里存的是裸指针, 因此每次显示时都从主题重新取当前字体
+        if (display_ != nullptr && display_->GetTheme() != nullptr) {
+            auto theme = static_cast<LvglTheme*>(display_->GetTheme());
+            if (theme->text_font() != nullptr && theme->text_font()->font() != nullptr &&
+                theme->text_font()->font()->get_glyph_dsc != nullptr) {
+                lv_obj_set_style_text_font(indicator_value_, theme->text_font()->font(), 0);
+            }
+            if (theme->icon_font() != nullptr && theme->icon_font()->font() != nullptr &&
+                theme->icon_font()->font()->get_glyph_dsc != nullptr) {
+                lv_obj_set_style_text_font(indicator_icon_, theme->icon_font()->font(), 0);
+            }
+        }
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", value);
+        lv_label_set_text(indicator_icon_,
+                          brightness ? MATERIAL_SYMBOLS_BRIGHTNESS_6 : MATERIAL_SYMBOLS_VOLUME_UP);
+        lv_label_set_text(indicator_value_, buf);
+        lv_bar_set_value(indicator_bar_, value, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(indicator_bar_,
+                                  lv_color_hex(brightness ? 0xFFB300 : 0x4FC3F7),
+                                  LV_PART_INDICATOR);
+        lv_obj_remove_flag(indicator_, LV_OBJ_FLAG_HIDDEN);
+        lv_timer_resume(indicator_hide_timer_);
+        lv_timer_reset(indicator_hide_timer_);
+    }
+
+    static void GestureEventCb(lv_event_t* e) {
+        auto* self = static_cast<LichuangDevBoard*>(lv_event_get_user_data(e));
+        lv_event_code_t code = lv_event_get_code(e);
+
+        if (code == LV_EVENT_PRESSED) {
+            lv_indev_t* indev = lv_indev_active();
+            if (indev == nullptr) return;
+            lv_indev_get_point(indev, &self->gesture_start_point_);
+            self->gesture_decided_ = false;
+            return;
+        }
+        if (code != LV_EVENT_PRESSING && code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) {
+            return;
+        }
+
+        if (code == LV_EVENT_PRESSING) {
+            lv_indev_t* indev = lv_indev_active();
+            if (indev == nullptr) return;
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+            int16_t dx = p.x - self->gesture_start_point_.x;
+            int16_t dy = self->gesture_start_point_.y - p.y;  // 上滑为正
+
+            if (!self->gesture_decided_) {
+                // 横向拖动不处理; 竖向需超过 16px 阈值才判定为调节手势
+                int16_t adx = dx < 0 ? -dx : dx;
+                int16_t ady = dy < 0 ? -dy : dy;
+                if (adx > 24 && adx > ady) return;
+                if (ady < 16) return;
+                self->gesture_decided_ = true;
+                self->gesture_is_brightness_ = self->gesture_start_point_.x < DISPLAY_WIDTH / 2;
+                self->gesture_start_value_ = self->gesture_is_brightness_
+                                                 ? self->GetBacklight()->brightness()
+                                                 : self->GetAudioCodec()->output_volume();
+            }
+
+            // 约 150px 竖直滑动覆盖 0~100 全量程
+            int value = self->gesture_start_value_ + dy * 100 / 150;
+            if (value < 0) value = 0;
+            if (value > 100) value = 100;
+            self->gesture_last_value_ = value;
+            if (self->gesture_is_brightness_) {
+                self->GetBacklight()->SetBrightness(value, false);
+            } else {
+                self->GetAudioCodec()->SetOutputVolume(value);
+            }
+            self->ShowAdjustIndicator(self->gesture_is_brightness_, value);
+            return;
+        }
+
+        // LV_EVENT_RELEASED / LV_EVENT_PRESS_LOST: 亮度持久化到设置, 重启后保持
+        if (self->gesture_decided_ && self->gesture_is_brightness_) {
+            Settings settings("display", true);
+            settings.SetInt("brightness", self->gesture_last_value_);
+        }
+        self->gesture_decided_ = false;
     }
 
 public:
-    LichuangDevBoard() : boot_button_(BOOT_BUTTON_GPIO) {
+    // BOOT: 短按=原生行为(说话/切对话), 长按(800ms)=回桌面
+    LichuangDevBoard() : boot_button_(BOOT_BUTTON_GPIO, false, 800) {
         InitializeI2c();
         InitializeSpi();
         InitializeSt7789Display();
         InitializeTouch();
+        InitializeTouchGestures();
         InitializeButtons();
         InitializeCamera();
         InitializeTools();
+        InitializeAppUi();
+        battery_ = new BatteryDevice(i2c_bus_, 0x55);
+        InitializeBattery();
 
         GetBacklight()->RestoreBrightness();
     }
@@ -310,6 +798,27 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (battery_ == nullptr) {
+            return false;
+        }
+        uint16_t mv = 0;
+        bool full = false;
+        if (!ReadBatteryVoltage(mv) || !ReadBatteryCharging(charging, full)) {
+            return false;  // I2C 读取失败, 本轮不显示
+        }
+        if (mv < 2500 || mv > 4500) {
+            return false;  // 电压不合理, 视为无电池
+        }
+        level = full ? 100 : SocFromVoltage(mv);
+        discharging = !charging;
+        if (level != battery_last_log_level_) {
+            battery_last_log_level_ = level;
+            ESP_LOGI(TAG, "Battery: %d%% (%d mV), charging=%d", level, mv, charging ? 1 : 0);
+        }
+        return true;
     }
 };
 
