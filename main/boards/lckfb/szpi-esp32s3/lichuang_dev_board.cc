@@ -466,6 +466,7 @@ private:
             ESP_LOGW(TAG, "Script storage unavailable, script games disabled");
         }
         script_app_ = new ScriptGameApp(display_, [this]() { SetUiMode(UiMode::kDesktop); });
+
         // 上传服务不能在这里启动: 板级构造时 lwip 还没初始化 (tcpip mbox 断言),
         // 推迟到网络就绪 (auto_desktop_timer 首次进入 idle 时) 再启动
     }
