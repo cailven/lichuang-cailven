@@ -69,6 +69,21 @@ function on_tick() end                        -- 每帧 (画完自动刷新)
 function on_touch(evt, x, y) end              -- evt: "down"/"move"/"up"
 ```
 
+### 硬件访问 API（均已板上实测）
+
+```lua
+imu.read()        -- 返回 ax,ay,az (g), gx,gy,gz (°/s); QMI8658 六轴
+camera.snapshot() -- GC2145 拍一帧, 居中裁剪画进 320x200 画布; 返回 true/false
+sound.beep(频率Hz, 时长ms, 音量0-100)  -- 正弦提示音 (小智说话时调用会混音)
+
+i2c.read(地址, 寄存器, 长度1-8)   -- 返回逐字节; 总线 100kHz
+i2c.write(地址, 寄存器, ...)      -- 板载芯片地址写保护 (0x18/19/38/3C/41/55)
+i2c.scan()                        -- 返回在线地址表 (Lua 数组)
+gpio.read(10 或 11)               -- 多功能口, 仅高阻输入 (电源保持线, 禁止输出)
+```
+
+硬件红线（代码强制）：GPIO10/11 无任何写路径；I2C 板载芯片禁写；扩展 I2C 口与板载总线共享，外接传感器即插即用。
+
 画布 320×200，坐标原点左上。完整示例见板级目录 `snake_lua_game.h`（贪吃蛇）与 `demo_lua_game.h`（接星星），或直接在安装器里点“编辑”看源码。
 
 ## 交互速查

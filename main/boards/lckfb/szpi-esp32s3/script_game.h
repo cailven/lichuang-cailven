@@ -48,6 +48,15 @@ public:
     void Exit() override;
     bool running() const override { return running_; }
 
+    // 供硬件绑定层 (script_hw) 使用: 取宿主与画布
+    static ScriptGameApp* HostOf(lua_State* L);
+    uint16_t* canvas_buffer() { return canvas_buf_; }
+    void InvalidateCanvas() {
+        if (canvas_ != nullptr) {
+            lv_obj_invalidate(canvas_);
+        }
+    }
+
     // 静态工具: 解析脚本源码元信息 (临时 VM, 用完即关)
     static bool PeekMeta(const std::string& source, ScriptAppMeta& meta);
     // 开机自检: 验证 Lua 引擎可创建可执行 (临时 VM)
@@ -74,7 +83,6 @@ private:
 
     // Lua 绑定
     static void RegisterApi(lua_State* L);
-    static ScriptGameApp* HostOf(lua_State* L);
     static int LuaFill(lua_State* L);
     static int LuaRect(lua_State* L);
     static int LuaText(lua_State* L);

@@ -1,6 +1,7 @@
 #include "script_game.h"
 
 #include "game_ui_common.h"
+#include "script_hw.h"
 #include "script_storage.h"
 
 #include <cctype>
@@ -90,6 +91,9 @@ lua_State* ScriptGameApp::NewSandboxedState(size_t* mem_counter, std::string& er
     // print 重定向到日志
     lua_pushcfunction(L, LuaPrint);
     lua_setglobal(L, "print");
+
+    // 硬件访问层 (imu/camera/sound/i2c/gpio)
+    ScriptHardware::RegisterApi(L);
 
     // 防死循环
     lua_sethook(L, CountHook, LUA_MASKCOUNT, kInstrLimit);

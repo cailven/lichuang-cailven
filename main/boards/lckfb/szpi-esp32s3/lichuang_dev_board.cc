@@ -15,6 +15,7 @@
 #include "game_ui_common.h"
 #include "script_game.h"
 #include "script_storage.h"
+#include "script_hw.h"
 #include "app_upload_server.h"
 #include "demo_lua_game.h"
 #include "snake_lua_game.h"
@@ -37,18 +38,53 @@
 class Pca9557 : public I2cDevice {
 public:
     Pca9557(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : I2cDevice(i2c_bus, addr) {
-        WriteReg(0x01, 0x03);
-        WriteReg(0x03, 0xf8);
+        WriteRegSafe(0x01, 0x03);
+        WriteRegSafe(0x03, 0xf8);
+        output_state_ = 0x03;
     }
 
     void SetOutputState(uint8_t bit, uint8_t level) {
-        uint8_t data = ReadReg(0x01);
+        // I2cDevice::ReadReg 内部是 ESP_ERROR_CHECK, I2C 瞬断会 panic 重启整台设备
+        // (sound.beep 的 EnableOutput 路径曾触发)。这里全部走带重试的安全读写,
+        // 读失败时退回上次写入的缓存值, 最多导致本轮开关无效, 绝不崩溃。
+        uint8_t data = 0;
+        if (!ReadRegSafe(0x01, &data)) {
+            data = output_state_;  // I2C 暂时不可达, 用缓存
+        }
         data = (data & ~(1 << bit)) | (level << bit);
-        WriteReg(0x01, data);
+        if (WriteRegSafe(0x01, data)) {
+            output_state_ = data;
+        }
     }
 
     uint8_t ReadInputPort() {
-        return ReadReg(0x00);
+        uint8_t data = 0;
+        ReadRegSafe(0x00, &data);
+        return data;
+    }
+
+private:
+    uint8_t output_state_ = 0;
+
+    bool ReadRegSafe(uint8_t reg, uint8_t* val) {
+        for (int i = 0; i < 3; i++) {
+            if (i2c_master_transmit_receive(i2c_device_, &reg, 1, val, 1, 50) == ESP_OK) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        return false;
+    }
+
+    bool WriteRegSafe(uint8_t reg, uint8_t val) {
+        uint8_t buf[2] = {reg, val};
+        for (int i = 0; i < 3; i++) {
+            if (i2c_master_transmit(i2c_device_, buf, 2, 50) == ESP_OK) {
+                return true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        return false;
     }
 };
 
@@ -319,8 +355,10 @@ private:
         ESP_LOGI(TAG, "App launcher ready (xiaozhi + snake + scripts)");
     }
 
-    // 脚本游戏平台: 存储挂载 + 出厂演示 + Lua 自检 + 上传服务
+    // 脚本游戏平台: 存储挂载 + 出厂演示 + Lua 自检 + 上传服务 + 硬件开放
     void InitializeScriptPlatform() {
+        // 硬件访问层: 把 I2C 总线/摄像头/音频交给脚本沙箱 (含安全红线, 见 script_hw.h)
+        ScriptHardware::Init(i2c_bus_, camera_, GetAudioCodec());
         // 时区: 小智联网会用服务器时间校准系统时间 (ota.cc), 但不设置时区;
         // game.time() 依赖 localtime, 这里固定为东八区
         setenv("TZ", "CST-8", 1);

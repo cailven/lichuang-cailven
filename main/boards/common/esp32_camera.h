@@ -39,4 +39,7 @@ public:
     virtual bool SetVFlip(bool enabled) override;
     virtual bool SetSwapBytes(bool enabled) override;
     virtual std::expected<std::string, std::string> Explain(const std::string& question) override;
+
+    // 实战派定制: 最近一帧的只读访问 (供 Lua camera.snapshot 使用, Capture() 后有效)
+    const camera_fb_t* current_frame() const { return current_fb_; }
 };

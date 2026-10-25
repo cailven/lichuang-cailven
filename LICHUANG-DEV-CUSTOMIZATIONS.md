@@ -257,6 +257,33 @@ esptool --port /dev/cu.usbmodem114301 --baud 921600 \
 - **踩坑** (都 costly): ① espressif/lua 头文件**无 extern "C"**, C++ 里必须手动包; ② Lua 5.5 的 `lua_newstate` 多了第三参 `seed`; 组件按 `-DLUA_32BITS` 编译 (lua_Integer=int32); ③ **httpd 不能在板级构造期启动** —— lwip 未初始化, tcpip mbox 断言 → 启动循环 (无 panic 输出, 表现为静默循环); 推迟到 kDeviceStateIdle 再启; ④ 分区表改动要同步改 sdkconfig 缓存 (defaults 不覆盖已有值, 必要时删 sdkconfig 全量重配)
 - **网络故障根因复盘 (2026-10-25, 已修复)**: 局域网 ping 板子 100% 丢包、Mac 连不上 :8080, 一度误判为路由器 AP 隔离 (华为 AX3 主网络其实没有隔离开关, 且华为路由器**没有网页后台**, 只能用智慧生活 App 管理, 路由器管理地址打不开是正常的)。真因: **Application 在 idle 时把 WiFi 切到 LOW_POWER = WIFI_PS_MAX_MODEM** (wifi_station.cc SetPowerSaveLevel), 华为路由器对深睡设备的来向单播直接丢弃; 对话时临时升档所以语音正常。修复: 板级覆写 SetPowerSaveLevel 把 LOW_POWER 钳制到 BALANCED (MIN_MODEM), 实测 ping 40-200ms、安装页全流程 (上传/列表/删除) 通过。另: esp_http_server 通配路径要配 `config.uri_match_fn = httpd_uri_match_wildcard`
 
+
+### 8.6 三期(硬件开放): Lua 脚本硬件 API (2026-10-25, 全部板上实测)
+
+script_hw.h/cc — imu/camera/sound/i2c/gpio 五组 API 注册进沙箱。安全红线:
+- GPIO10/11 仅高阻只读 (电源保持线), 无任何写路径
+- I2C 写屏蔽板载地址 {0x18,0x19,0x38,0x3C,0x41,0x55}; 0x6A(IMU) 与外接可写
+- IMU: QMI8658 驱动移植自官方例程 (复位→**等15ms**→CTRL1/7/2/3, 每写间隔2ms)
+- 摄像头: Esp32Camera 加了 current_frame() 只读访问器 (上游文件, 2行),
+  snapshot 拍 QVGA RGB565 垂直居中裁剪到 320x200 直拷画布
+- 声音: 正弦发生器(24kHz, 5ms淡入淡出) → AudioCodec::OutputData 直写
+
+**本日四大坑 (全部实测代价)**:
+1. **I2C 必须 100kHz**: 400k 时扫描大量幻影 ACK (每次集合还不同)、IMU 数据错位
+   (±满量程垃圾) — 摄像头 DVP 高速翻转的干扰下信号完整性不足; 100k 完美干净
+   (扫描精确 7 设备)。i2c_master_probe 速率不可控, 扫描改用自建 100k 读探测
+2. **QMI8658 复位后必须延时再写配置**: 复位后连写 CTRL 会全部丢失 → 传感器
+   使能位没开 → 数据永远垃圾; 官方例程的 delay(10) 不能省
+3. **STATUS0 就绪位是读后清零**: 靠轮询它判数据会踩不中 4ms 节拍 (闲置后永远
+   nil); 解法=盲读 12 字节数据寄存器 (250Hz 持续出数, 永远有最新样本)
+4. **PCA9557 的 I2cDevice::ReadReg 是 ESP_ERROR_CHECK**: sound.beep→EnableOutput
+   →SetOutputState→ReadReg, I2C 瞬断直接 panic 重启整台 (板上 I2C 瞬断是常态,
+   电池驱动当年就为此写过 ReadRegSafe)。已把板内 Pca9557 类整体安全化
+   (重试3次+缓存回退), xiaozhi 自己的音频开关路径同时受益
+
+IMU 实测: 静置 acc=(-0.08, 0.00, 0.99)g (Z 轴重力, 物理正确), gyr 零偏个位数;
+闲置 60s+ 读数依旧即时; 三连 beep 无崩溃。
+
 ### 8.5 烧录连接故障排查 (2026-10-25 实录)
 
 esptool 反复 "No serial data received" (default-reset/usb-reset 均无效, 复位脉冲也收不到启动日志, 但 macOS 侧端口可打开): 原生 USB-Serial/JTAG 数据通路卡死 (疑似电脑休眠唤醒后)。**解决: 拔插 USB 线即可恢复**。另外注意: 启动阶段 (kDeviceStateStarting) 按 BOOT 会进配网模式 (原版行为), 观察日志时别碰按键。
