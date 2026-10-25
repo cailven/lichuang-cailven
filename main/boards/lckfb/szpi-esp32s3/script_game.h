@@ -82,6 +82,7 @@ private:
     static int LuaExit(lua_State* L);
     static int LuaRandom(lua_State* L);
     static int LuaMillis(lua_State* L);
+    static int LuaTime(lua_State* L);
     static int LuaPrint(lua_State* L);
     static void* LuaAlloc(void* ud, void* ptr, size_t osize, size_t nsize);
     static lua_State* NewSandboxedState(size_t* mem_counter, std::string& error);

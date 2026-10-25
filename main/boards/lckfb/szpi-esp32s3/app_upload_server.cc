@@ -1,5 +1,6 @@
 #include "app_upload_server.h"
 
+#include "script_game.h"
 #include "script_storage.h"
 
 #include <esp_log.h>
@@ -34,11 +35,12 @@ static const char* kPage =
     "<div class=card><h3>脚本 API</h3><pre>"
     "app = { title=\"标题\", color=0xRRGGBB }\n"
     "canvas.fill(c)  canvas.rect(x,y,w,h,c)  canvas.text(x,y,s,c)\n"
-    "game.set_tick_period(ms)  game.exit()\n"
+    "game.set_tick_period(ms)  game.exit()  game.time()\n"
     "game.random(n)  game.millis()  print(s)\n"
+    "game.time() 返回 h,m,s,年,月,日 (联网校时)\n"
     "on_start()  on_tick()  on_touch(evt,x,y)  -- evt: down/move/up\n"
     "标准库: string table math | 画布 320x200 | 颜色 0xRRGGBB\n"
-    "中文标题需等字体推送后显示, 重启回桌面生效</pre></div>"
+    "中文需等字体推送后显示, 回桌面图标即时刷新</pre></div>"
     "<script>"
     "async function refresh(){let r=await fetch('/api/apps');let j=await r.json();"
     "let ul=document.getElementById('list');ul.innerHTML='';"
@@ -52,7 +54,7 @@ static const char* kPage =
     "let n=document.getElementById('name').value.trim()||f.name.replace(/\\.lua$/,'');"
     "if(!/^[-_A-Za-z0-9]+$/.test(n)){document.getElementById('msg').textContent=' 名字只能字母数字-_';return;}"
     "let r=await fetch('/upload?name='+encodeURIComponent(n),{method:'PUT',body:f});"
-    "document.getElementById('msg').textContent=r.ok?' 已安装':' 失败';refresh();}"
+    "document.getElementById('msg').textContent=r.ok?(' '+(await r.text())):' 失败';refresh();}"
     "refresh();</script></body></html>";
 
 esp_err_t AppUploadServer::PageHandler(httpd_req_t* req) {
@@ -110,8 +112,15 @@ esp_err_t AppUploadServer::UploadHandler(httpd_req_t* req) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save failed");
         return ESP_FAIL;
     }
-    const char* msg = "installed";
-    httpd_resp_send(req, msg, strlen(msg));
+    // 装完立即用沙箱跑一遍脚本顶层, 语法/顶层错误当场反馈 (运行期错误仍需打开游戏才知道)
+    ScriptAppMeta meta;
+    if (!ScriptGameApp::PeekMeta(content, meta)) {
+        std::string msg = "installed, but script error: top-level run failed";
+        httpd_resp_send(req, msg.c_str(), msg.size());
+        return ESP_OK;
+    }
+    std::string msg = "installed: " + meta.title;
+    httpd_resp_send(req, msg.c_str(), msg.size());
     return ESP_OK;
 }
 

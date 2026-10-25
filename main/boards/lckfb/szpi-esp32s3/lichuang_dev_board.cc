@@ -305,6 +305,13 @@ private:
                         lv_timer_pause(timer);  // 只自动进一次
                         // 网络已就绪, 启动游戏上传服务 (构造期启动会在 lwip 初始化前崩)
                         AppUploadServer::Start();
+                        // 此刻系统时间已被服务器校准, 打出来核对时区 (game.time 的数据源)
+                        time_t now = time(NULL);
+                        struct tm tmv = {};
+                        localtime_r(&now, &tmv);
+                        ESP_LOGI(TAG, "Local time: %04d-%02d-%02d %02d:%02d:%02d",
+                                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour,
+                                 tmv.tm_min, tmv.tm_sec);
                         self->SetUiMode(UiMode::kDesktop);
                     }
                 },
@@ -316,6 +323,10 @@ private:
 
     // 脚本游戏平台: 存储挂载 + 出厂演示 + Lua 自检 + 上传服务
     void InitializeScriptPlatform() {
+        // 时区: 小智联网会用服务器时间校准系统时间 (ota.cc), 但不设置时区;
+        // game.time() 依赖 localtime, 这里固定为东八区
+        setenv("TZ", "CST-8", 1);
+        tzset();
         if (ScriptStorage::Mount()) {
             if (ScriptStorage::ListApps().empty()) {
                 ScriptStorage::WriteApp("demo_catch", kDemoLuaGame);

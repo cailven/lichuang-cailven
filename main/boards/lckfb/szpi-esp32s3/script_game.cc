@@ -17,6 +17,7 @@ extern "C" {
 
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #define TAG "ScriptGame"
 
@@ -115,6 +116,8 @@ void ScriptGameApp::RegisterApi(lua_State* L) {
     lua_setfield(L, -2, "random");
     lua_pushcfunction(L, LuaMillis);
     lua_setfield(L, -2, "millis");
+    lua_pushcfunction(L, LuaTime);
+    lua_setfield(L, -2, "time");
     lua_setglobal(L, "game");
 
     // 宿主指针挂到注册表
@@ -206,6 +209,20 @@ int ScriptGameApp::LuaRandom(lua_State* L) {
 int ScriptGameApp::LuaMillis(lua_State* L) {
     lua_pushinteger(L, (lua_Integer)(esp_timer_get_time() / 1000));
     return 1;
+}
+
+// 返回本地时间 h, m, s, year, month, day (系统时间由小智联网校时, 时区在板级设置)
+int ScriptGameApp::LuaTime(lua_State* L) {
+    time_t now = time(NULL);
+    struct tm tm_local = {};
+    localtime_r(&now, &tm_local);
+    lua_pushinteger(L, tm_local.tm_hour);
+    lua_pushinteger(L, tm_local.tm_min);
+    lua_pushinteger(L, tm_local.tm_sec);
+    lua_pushinteger(L, tm_local.tm_year + 1900);
+    lua_pushinteger(L, tm_local.tm_mon + 1);
+    lua_pushinteger(L, tm_local.tm_mday);
+    return 6;
 }
 
 int ScriptGameApp::LuaPrint(lua_State* L) {
