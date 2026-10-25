@@ -26,10 +26,10 @@ static lv_obj_t* MakeSlider(lv_obj_t* parent, int y) {
     return s;
 }
 
-static lv_obj_t* MakeButton(lv_obj_t* parent, const char* text, int x, int y, int w, uint32_t color,
-                            lv_event_cb_t cb, void* user_data) {
+static lv_obj_t* MakeButton(lv_obj_t* parent, lv_obj_t** label_out, int x, int y, int w,
+                            uint32_t color, lv_event_cb_t cb, void* user_data) {
     lv_obj_t* btn = lv_obj_create(parent);
-    lv_obj_set_size(btn, w, 44);
+    lv_obj_set_size(btn, w, 42);
     lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
     lv_obj_set_style_radius(btn, 12, 0);
     lv_obj_set_style_bg_color(btn, lv_color_hex(color), 0);
@@ -41,8 +41,23 @@ static lv_obj_t* MakeButton(lv_obj_t* parent, const char* text, int x, int y, in
     lv_obj_t* label = lv_label_create(btn);
     lv_obj_center(label);
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
-    lv_label_set_text(label, text);
+    if (label_out != nullptr) {
+        *label_out = label;
+    }
     return btn;
+}
+
+void SettingsPanel::ResetConfirm() {
+    confirming_ = 0;
+    lv_timer_pause(confirm_timer_);
+    // 标签文字在 ApplyFonts/字体状态允许时重设; 这里用当前主题字体
+    const lv_font_t* text_font = SafeThemeFont(display_ != nullptr ? display_->GetTheme() : nullptr, false);
+    if (wifi_btn_label_ != nullptr) {
+        lv_label_set_text(wifi_btn_label_, PickText(text_font, "重新配网", "Wi-Fi Setup"));
+    }
+    if (reboot_btn_label_ != nullptr) {
+        lv_label_set_text(reboot_btn_label_, PickText(text_font, "重启", "Reboot"));
+    }
 }
 
 void SettingsPanel::Build() {
@@ -54,9 +69,10 @@ void SettingsPanel::Build() {
     screen_ = lv_obj_create(nullptr);
     lv_obj_set_style_bg_color(screen_, bg, 0);
 
+    // 顶栏
     lv_obj_t* bar = lv_obj_create(screen_);
     lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 320, 36);
+    lv_obj_set_size(bar, 320, 34);
     lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
 
     title_label_ = lv_label_create(bar);
@@ -65,7 +81,7 @@ void SettingsPanel::Build() {
     lv_label_set_text(title_label_, "Settings");
 
     lv_obj_t* close_btn = lv_obj_create(bar);
-    lv_obj_set_size(close_btn, 36, 30);
+    lv_obj_set_size(close_btn, 36, 28);
     lv_obj_align(close_btn, LV_ALIGN_RIGHT_MID, -4, 0);
     lv_obj_set_style_radius(close_btn, 10, 0);
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x2A2F35), 0);
@@ -85,12 +101,12 @@ void SettingsPanel::Build() {
     lv_obj_set_style_text_color(close_icon_, lv_color_white(), 0);
     lv_label_set_text(close_icon_, MATERIAL_SYMBOLS_CLOSE);
 
-    // 亮度
+    // 亮度 (y 42..76)
     bright_label_ = lv_label_create(screen_);
-    lv_obj_align(bright_label_, LV_ALIGN_TOP_LEFT, 16, 46);
+    lv_obj_align(bright_label_, LV_ALIGN_TOP_LEFT, 16, 42);
     lv_obj_set_style_text_color(bright_label_, lv_color_hex(0xC8D2DC), 0);
     lv_label_set_text(bright_label_, "Brightness");
-    bright_slider_ = MakeSlider(screen_, 66);
+    bright_slider_ = MakeSlider(screen_, 60);
     lv_obj_add_event_cb(
         bright_slider_,
         [](lv_event_t* e) {
@@ -100,12 +116,12 @@ void SettingsPanel::Build() {
         },
         LV_EVENT_VALUE_CHANGED, this);
 
-    // 音量
+    // 音量 (y 92..126)
     volume_label_ = lv_label_create(screen_);
-    lv_obj_align(volume_label_, LV_ALIGN_TOP_LEFT, 16, 100);
+    lv_obj_align(volume_label_, LV_ALIGN_TOP_LEFT, 16, 92);
     lv_obj_set_style_text_color(volume_label_, lv_color_hex(0xC8D2DC), 0);
     lv_label_set_text(volume_label_, "Volume");
-    volume_slider_ = MakeSlider(screen_, 120);
+    volume_slider_ = MakeSlider(screen_, 110);
     lv_obj_add_event_cb(
         volume_slider_,
         [](lv_event_t* e) {
@@ -115,52 +131,88 @@ void SettingsPanel::Build() {
         },
         LV_EVENT_VALUE_CHANGED, this);
 
-    // 操作按钮: 重新配网 / 重启
-    MakeButton(screen_, "重新配网", 16, 150, 138, 0x8A6D3B, [](lv_event_t* e) {
+    // 操作按钮 (y 138..180): 危险操作需 3 秒内两次点击
+    wifi_btn_ = MakeButton(screen_, &wifi_btn_label_, 16, 138, 138, 0x8A6D3B, [](lv_event_t* e) {
         if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
         auto* self = static_cast<SettingsPanel*>(lv_event_get_user_data(e));
+        if (self->confirming_ != 1) {
+            self->confirming_ = 1;
+            lv_label_set_text(self->wifi_btn_label_, "再点一次确认");
+            lv_timer_reset(self->confirm_timer_);
+            lv_timer_resume(self->confirm_timer_);
+            return;
+        }
+        self->ResetConfirm();
         if (self->cb_.enter_wifi_config) self->cb_.enter_wifi_config();
     }, this);
-    MakeButton(screen_, "重启", 166, 150, 138, 0x8A3A3A, [](lv_event_t* e) {
+
+    reboot_btn_ = MakeButton(screen_, &reboot_btn_label_, 166, 138, 138, 0x8A3A3A, [](lv_event_t* e) {
         if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
         auto* self = static_cast<SettingsPanel*>(lv_event_get_user_data(e));
+        if (self->confirming_ != 2) {
+            self->confirming_ = 2;
+            lv_label_set_text(self->reboot_btn_label_, "再点一次确认");
+            lv_timer_reset(self->confirm_timer_);
+            lv_timer_resume(self->confirm_timer_);
+            return;
+        }
         if (self->cb_.reboot) self->cb_.reboot();
     }, this);
 
-    // 蓝牙行: 本固件未编译蓝牙 (xiaozhi 基线 CONFIG_BT_ENABLED 未开), 如实说明
+    // 确认超时定时器 (3 秒后恢复按钮文字)
+    confirm_timer_ = lv_timer_create(
+        [](lv_timer_t* timer) {
+            auto* self = static_cast<SettingsPanel*>(lv_timer_get_user_data(timer));
+            self->ResetConfirm();
+        },
+        3000, this);
+    lv_timer_pause(confirm_timer_);
+
+    // 蓝牙行 (y 192): 本固件未编译蓝牙, 如实说明
     lv_obj_t* bt_icon = lv_label_create(screen_);
-    lv_obj_align(bt_icon, LV_ALIGN_TOP_LEFT, 16, 204);
+    lv_obj_align(bt_icon, LV_ALIGN_TOP_LEFT, 16, 192);
     lv_obj_set_style_text_color(bt_icon, lv_color_hex(0x5A6A7A), 0);
     lv_label_set_text(bt_icon, MATERIAL_SYMBOLS_BLUETOOTH);
-    lv_obj_t* bt_label = lv_label_create(screen_);
-    lv_obj_align(bt_label, LV_ALIGN_TOP_LEFT, 44, 208);
-    lv_obj_set_style_text_color(bt_label, lv_color_hex(0x5A6A7A), 0);
-    lv_label_set_text(bt_label, "Bluetooth: not compiled");
+    bt_label_ = lv_label_create(screen_);
+    lv_obj_align(bt_label_, LV_ALIGN_TOP_LEFT, 42, 196);
+    lv_obj_set_style_text_color(bt_label_, lv_color_hex(0x5A6A7A), 0);
+    lv_label_set_text(bt_label_, "Bluetooth: not compiled");
 
-    // 底部信息行
+    // 底部信息行 (y 222+)
     info_label_ = lv_label_create(screen_);
-    lv_obj_align(info_label_, LV_ALIGN_BOTTOM_LEFT, 16, -6);
+    lv_obj_align(info_label_, LV_ALIGN_BOTTOM_LEFT, 16, -4);
     lv_obj_set_style_text_color(info_label_, lv_color_hex(0x566878), 0);
     lv_label_set_text(info_label_, "");
 }
 
 void SettingsPanel::ApplyFonts() {
-    const lv_font_t* text_font = SafeThemeFont(display_ != nullptr ? display_->GetTheme() : nullptr, false);
+    Theme* theme = display_ != nullptr ? display_->GetTheme() : nullptr;
+    const lv_font_t* text_font = SafeThemeFont(theme, false);
+    const lv_font_t* icon_font = SafeThemeFont(theme, true);
     ApplyFont(title_label_, text_font);
     ApplyFont(bright_label_, text_font);
     ApplyFont(volume_label_, text_font);
     ApplyFont(info_label_, text_font);
-    ApplyFont(close_icon_,
-              SafeThemeFont(display_ != nullptr ? display_->GetTheme() : nullptr, true));
+    ApplyFont(close_icon_, icon_font);
+    ApplyFont(wifi_btn_label_, text_font);
+    ApplyFont(reboot_btn_label_, text_font);
+    ApplyFont(bt_label_, text_font);
     lv_label_set_text(title_label_, PickText(text_font, "设置", "Settings"));
     lv_label_set_text(bright_label_, PickText(text_font, "屏幕亮度", "Brightness"));
     lv_label_set_text(volume_label_, PickText(text_font, "音量", "Volume"));
+    lv_label_set_text(bt_label_, PickText(text_font, "蓝牙: 固件未编译", "Bluetooth: not compiled"));
+    if (confirming_ == 0) {
+        lv_label_set_text(wifi_btn_label_, PickText(text_font, "重新配网", "Wi-Fi Setup"));
+        lv_label_set_text(reboot_btn_label_, PickText(text_font, "重启", "Reboot"));
+    }
 }
 
 void SettingsPanel::Show() {
     if (!built_) {
         Build();
     }
+    confirming_ = 0;
+    lv_timer_pause(confirm_timer_);
     ApplyFonts();
     if (cb_.get_brightness) {
         lv_slider_set_value(bright_slider_, cb_.get_brightness(), LV_ANIM_OFF);
@@ -169,8 +221,6 @@ void SettingsPanel::Show() {
         lv_slider_set_value(volume_slider_, cb_.get_volume(), LV_ANIM_OFF);
     }
     if (cb_.info) {
-        ApplyFont(info_label_,
-                  SafeThemeFont(display_ != nullptr ? display_->GetTheme() : nullptr, false));
         lv_label_set_text(info_label_, cb_.info().c_str());
     }
     lv_screen_load(screen_);
