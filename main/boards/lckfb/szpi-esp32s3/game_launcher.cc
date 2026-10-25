@@ -54,14 +54,16 @@ void DesktopLauncher::Build() {
     lv_obj_set_style_text_color(status_label_, text_color_, 0);
     lv_label_set_text(status_label_, "");
 
-    // 中部图标区: 行换行排列, 单元格内 "图标在上 标题在下"
+    // 中部图标区: 单行横排 + 水平滚动 (图标多了左右滑动翻看)
     apps_area_ = lv_obj_create(screen_);
     lv_obj_remove_style_all(apps_area_);
     lv_obj_set_size(apps_area_, 320, 240 - kStatusBarHeight - kHintBarHeight);
     lv_obj_align(apps_area_, LV_ALIGN_TOP_MID, 0, kStatusBarHeight);
-    lv_obj_remove_flag(apps_area_, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(apps_area_, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(apps_area_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_flow(apps_area_, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(apps_area_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(apps_area_, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(apps_area_, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_pad_all(apps_area_, 0, 0);
     lv_obj_set_style_pad_row(apps_area_, 8, 0);
     lv_obj_set_style_pad_column(apps_area_, 4, 0);
 
@@ -148,6 +150,10 @@ void DesktopLauncher::BuildAppButtons(const std::vector<AppEntry>& entries) {
 
         built_apps_.push_back(app);
     }
+    // 图标总宽不超屏时水平居中, 超出则靠左排列进入横向滚动
+    int n = (int)built_apps_.size();
+    int content_w = n > 0 ? n * kCellWidth + (n - 1) * 4 : 0;
+    lv_obj_set_style_pad_left(apps_area_, content_w < 320 ? (320 - content_w) / 2 : 4, 0);
 }
 
 void DesktopLauncher::RefreshFonts() {

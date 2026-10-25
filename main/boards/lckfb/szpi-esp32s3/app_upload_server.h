@@ -16,5 +16,6 @@ private:
     static esp_err_t PageHandler(httpd_req_t* req);      // GET /
     static esp_err_t ListHandler(httpd_req_t* req);      // GET /api/apps
     static esp_err_t UploadHandler(httpd_req_t* req);    // PUT /upload?name=xxx
+    static esp_err_t GetAppHandler(httpd_req_t* req);    // GET /app/xxx (在线编辑器读取)
     static esp_err_t DeleteHandler(httpd_req_t* req);    // DELETE /app/xxx
 };

@@ -20,15 +20,22 @@ static const char* kPage =
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>小智游戏安装器</title><style>"
-    "body{font-family:sans-serif;background:#10141a;color:#e0e0e0;max-width:640px;margin:16px auto;padding:0 12px}"
+    "body{font-family:sans-serif;background:#10141a;color:#e0e0e0;max-width:680px;margin:16px auto;padding:0 12px}"
     "h2{color:#7ecb8f} .card{background:#1a2028;border-radius:12px;padding:12px 16px;margin:14px 0}"
     "button{background:#2e7d32;color:#fff;border:0;border-radius:8px;padding:6px 14px;margin-left:8px}"
-    "button.del{background:#8a3a3a} input{background:#0d1117;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:5px}"
+    "button.del{background:#8a3a3a} button.ed{background:#1565c0}"
+    "input,textarea{background:#0d1117;color:#e0e0e0;border:1px solid #333;border-radius:6px;padding:5px}"
     "li{margin:6px 0;display:flex;align-items:center} ul{list-style:none;padding:0}"
     "pre{background:#0d1117;padding:10px;border-radius:8px;overflow-x:auto;font-size:13px}"
+    "textarea{width:100%;min-height:280px;font-family:monospace;font-size:13px;line-height:1.4;box-sizing:border-box}"
     "</style></head><body><h2>\xF0\x9F\x8E\xAE 小智游戏安装器</h2>"
-    "<div class=card><h3>已安装</h3><ul id=list>加载中...</ul></div>"
-    "<div class=card><h3>安装新游戏</h3>"
+    "<div class=card><h3>已安装</h3><ul id=list>加载中...</ul>"
+    "<button class=ed onclick=newApp()>新建脚本</button></div>"
+    "<div class=card id=editor style=\"display:none\"><h3 id=edTitle>编辑</h3>"
+    "<textarea id=code spellcheck=false></textarea>"
+    "<p><button onclick=saveCode()>保存</button>"
+    "<button class=del onclick=closeEd()>关闭</button><span id=edMsg></span></p></div>"
+    "<div class=card><h3>上传文件安装</h3>"
     "<p>名字 <input id=name placeholder=\"mygame\"></p>"
     "<p><input type=file id=file accept=\".lua\"></p>"
     "<p><button onclick=up()>安装</button><span id=msg></span></p></div>"
@@ -42,13 +49,37 @@ static const char* kPage =
     "标准库: string table math | 画布 320x200 | 颜色 0xRRGGBB\n"
     "中文需等字体推送后显示, 回桌面图标即时刷新</pre></div>"
     "<script>"
+    "let curName='';"
     "async function refresh(){let r=await fetch('/api/apps');let j=await r.json();"
     "let ul=document.getElementById('list');ul.innerHTML='';"
     "if(!j.apps.length){ul.innerHTML='<li>(空)</li>';return;}"
     "for(const a of j.apps){let li=document.createElement('li');"
-    "li.textContent=a;let b=document.createElement('button');b.className='del';"
-    "b.textContent='删除';b.onclick=async()=>{await fetch('/app/'+encodeURIComponent(a),{method:'DELETE'});refresh()};"
+    "li.textContent=a;"
+    "let be=document.createElement('button');be.className='ed';be.textContent='编辑';be.onclick=()=>editApp(a);li.appendChild(be);"
+    "let b=document.createElement('button');b.className='del';b.textContent='删除';"
+    "b.onclick=async()=>{await fetch('/app/'+encodeURIComponent(a),{method:'DELETE'});if(curName===a)closeEd();refresh()};"
     "li.appendChild(b);ul.appendChild(li);}}"
+    "async function editApp(n){curName=n;"
+    "document.getElementById('edTitle').textContent='编辑 '+n;"
+    "document.getElementById('editor').style.display='block';"
+    "document.getElementById('edMsg').textContent=' 加载中...';"
+    "let r=await fetch('/app/'+encodeURIComponent(n));"
+    "document.getElementById('code').value=await r.text();"
+    "document.getElementById('edMsg').textContent='';"
+    "window.scrollTo(0,document.body.scrollHeight);}"
+    "function newApp(){let n=prompt('新脚本名字 (字母数字-_):');"
+    "if(!n||!/^[-_A-Za-z0-9]+$/.test(n)){return;}"
+    "curName=n;document.getElementById('edTitle').textContent='新建 '+n;"
+    "document.getElementById('editor').style.display='block';"
+    "document.getElementById('code').value='app = { title = \"'+n+'\", color = 0x5C6BC0 }\\n\\nfunction on_start()\\n    game.set_tick_period(200)\\nend\\n\\nfunction on_tick()\\n    canvas.fill(0x10141A)\\nend\\n';"
+    "document.getElementById('edMsg').textContent='';"
+    "window.scrollTo(0,document.body.scrollHeight);}"
+    "async function saveCode(){if(!curName)return;"
+    "let c=document.getElementById('code').value;"
+    "document.getElementById('edMsg').textContent=' 保存中...';"
+    "let r=await fetch('/upload?name='+encodeURIComponent(curName),{method:'PUT',body:c});"
+    "document.getElementById('edMsg').textContent=' '+(await r.text());refresh();}"
+    "function closeEd(){document.getElementById('editor').style.display='none';curName='';}"
     "async function up(){let f=document.getElementById('file').files[0];"
     "if(!f){document.getElementById('msg').textContent=' 先选 .lua 文件';return;}"
     "let n=document.getElementById('name').value.trim()||f.name.replace(/\\.lua$/,'');"
@@ -124,6 +155,29 @@ esp_err_t AppUploadServer::UploadHandler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+esp_err_t AppUploadServer::GetAppHandler(httpd_req_t* req) {
+    // GET /app/<name> → 返回脚本文本 (在线编辑器的读取接口)
+    std::string name;
+    const char* uri = req->uri;
+    const char* prefix = "/app/";
+    if (strncmp(uri, prefix, strlen(prefix)) == 0) {
+        name = uri + strlen(prefix);
+        size_t q = name.find('?');
+        if (q != std::string::npos) {
+            name = name.substr(0, q);
+        }
+    }
+    std::string content;
+    if (!ScriptStorage::ReadApp(name, content)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "not found");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, HTTPD_TYPE_TEXT);
+    httpd_resp_set_hdr(req, "Content-Type", "text/plain; charset=utf-8");
+    httpd_resp_send(req, content.c_str(), content.size());
+    return ESP_OK;
+}
+
 esp_err_t AppUploadServer::DeleteHandler(httpd_req_t* req) {
     // 路径形如 /app/<name>, 直接解析 URI
     std::string name;
@@ -159,10 +213,12 @@ bool AppUploadServer::Start() {
     httpd_uri_t page = {.uri = "/", .method = HTTP_GET, .handler = PageHandler, .user_ctx = nullptr};
     httpd_uri_t list = {.uri = "/api/apps", .method = HTTP_GET, .handler = ListHandler, .user_ctx = nullptr};
     httpd_uri_t upload = {.uri = "/upload", .method = HTTP_PUT, .handler = UploadHandler, .user_ctx = nullptr};
+    httpd_uri_t get_app = {.uri = "/app/*", .method = HTTP_GET, .handler = GetAppHandler, .user_ctx = nullptr};
     httpd_uri_t del = {.uri = "/app/*", .method = HTTP_DELETE, .handler = DeleteHandler, .user_ctx = nullptr};
     httpd_register_uri_handler(server_, &page);
     httpd_register_uri_handler(server_, &list);
     httpd_register_uri_handler(server_, &upload);
+    httpd_register_uri_handler(server_, &get_app);
     httpd_register_uri_handler(server_, &del);
     ESP_LOGI(TAG, "Game installer ready on port 8080");
     return true;
