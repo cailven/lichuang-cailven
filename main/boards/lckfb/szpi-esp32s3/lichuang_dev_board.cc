@@ -22,6 +22,8 @@
 
 #include <esp_netif.h>
 
+#include <esp_heap_caps.h>
+
 #include <map>
 #include <utility>
 
@@ -197,6 +199,29 @@ private:
         }
     }
 
+    // 界面静默: 进桌面/游戏时停止小智的说话与监听 (否则它还在自顾自说话, 很诡异),
+    // 并关闭唤醒词检测 (麦克风完全安静 + 省音频引擎开销); 回聊天界面时恢复
+    void QuietXiaozhi() {
+        auto& app = Application::GetInstance();
+        app.AbortSpeaking(kAbortReasonNone);
+        app.StopListening();
+        auto& audio = app.GetAudioService();
+        if (audio.IsWakeWordRunning()) {
+            audio.EnableWakeWordDetection(false);
+            ESP_LOGI(TAG, "Xiaozhi quiet: wake word off, free sram=%u psram=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        }
+    }
+
+    void ResumeXiaozhi() {
+        auto& audio = Application::GetInstance().GetAudioService();
+        if (!audio.IsWakeWordRunning()) {
+            audio.EnableWakeWordDetection(true);
+            ESP_LOGI(TAG, "Xiaozhi resumed: wake word on");
+        }
+    }
+
     void SetUiMode(UiMode mode) {
         if (mode == ui_mode_) {
             return;
@@ -236,6 +261,7 @@ private:
                     }
                     lv_obj_remove_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
                 }
+                ResumeXiaozhi();  // 回到小智: 恢复唤醒词
                 lv_screen_load(chat_screen_);
                 break;
             case UiMode::kDesktop:
@@ -245,6 +271,7 @@ private:
                 if (home_btn_ != nullptr) {
                     lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
                 }
+                QuietXiaozhi();  // 桌面模式: 小智静默
                 launcher_->Show();
                 break;
             case UiMode::kGame:
@@ -254,6 +281,7 @@ private:
                 if (home_btn_ != nullptr) {
                     lv_obj_add_flag(home_btn_, LV_OBJ_FLAG_HIDDEN);
                 }
+                QuietXiaozhi();  // 游戏模式同样静默
                 active_game_->Enter();
                 break;
         }
