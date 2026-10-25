@@ -912,6 +912,16 @@ public:
         }
         return true;
     }
+
+    // 小智 idle 时会切 MAX_MODEM 深度省电, 华为等路由器会丢弃发往"沉睡设备"的
+    // 来向数据 (局域网 ping/连接全丢, 但出向和语音不受影响); 钳制到 BALANCED
+    // (每个 DTIM 唤醒, 来向数据可达, 功耗仅略增), 保住局域网游戏安装页可用
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level == PowerSaveLevel::LOW_POWER) {
+            level = PowerSaveLevel::BALANCED;
+        }
+        WifiBoard::SetPowerSaveLevel(level);
+    }
 };
 
 DECLARE_BOARD(LichuangDevBoard);

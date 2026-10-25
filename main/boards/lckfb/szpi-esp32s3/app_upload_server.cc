@@ -141,6 +141,7 @@ bool AppUploadServer::Start() {
     config.server_port = 8080;
     config.max_uri_handlers = 8;
     config.lru_purge_enable = true;
+    config.uri_match_fn = httpd_uri_match_wildcard;  // 支持 /app/* 通配删除路径
     esp_err_t err = httpd_start(&server_, &config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start upload server: %s", esp_err_to_name(err));
