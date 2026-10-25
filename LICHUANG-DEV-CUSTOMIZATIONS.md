@@ -1,6 +1,6 @@
 # 立创·实战派 ESP32-S3 (lichuang-dev) 小智固件定制 — 交接文档
 
-> **文档目的**: 本文档记录实战派小智定制固件的开发全过程与踩坑实录 (2026-10-24 ~ 10-25), 供后续开发者或 AI 助手接手。
+> **文档目的**: 本文档记录 2026-10-24 对小智固件的定制开发全过程, 供后续开发者或 AI 助手接手。
 > **接手须知**: 先读 §2 硬件档案和 §2.4 危险操作清单 (避免烧板/断电事故), 再读 §4 代码改造。
 > 源码位置: `~/esp/xiaozhi-esp32` (78/xiaozhi-esp32, main 分支 @ v2.5.3 + 本地修改, 与上游的差异用 `git diff` 查看)。
 
@@ -14,9 +14,9 @@
 | 主控 | ESP32-S3-WROOM-1-N16R8 (16MB Quad Flash + 8MB Octal PSRAM, **IO35/36/37 被 PSRAM 占用不可用**) |
 | 板上固件 | 小智 AI (xiaozhi) v2.5.3 定制版, 基于 ESP-IDF v6.0.2 编译 |
 | 原厂固件 | xiaozhi v2.4.2 (IDF v6.0.2), 完整备份在 `~/esp/backups/xiaozhi_esp32s3_2026-10-24/` |
-| 已完成改造 | ① 触屏手势 ② 电池显示 ③ 应用桌面+Lua 脚本游戏引擎 (详见 §8) |
+| 已完成改造 | ① 触屏手势调亮度/音量 ② 电池电量显示 (英集芯 IP5xx 驱动) |
 | 串口 | `/dev/cu.usbmodem114301` (ESP32-S3 原生 USB-Serial/JTAG, 复位/烧录/日志三合一) |
-| WiFi | NVS 中存有 SSID 配置(已脱敏), 烧录应用分区不会丢失 |
+| WiFi | NVS 中存有 SSID "lovely" 的配置, 烧录应用分区不会丢失 |
 
 ---
 
@@ -255,34 +255,7 @@ esptool --port /dev/cu.usbmodem114301 --baud 921600 \
 - **沙箱**: 只开 base/string/table/math; Lua 内存 PSRAM 限额 512KB (自定义分配器); 指令钩子 5M 防死循环; 全 pcall 隔离
 - **脚本 API**: `app={title,color}` + `canvas.fill/rect/text` (0xRRGGBB) + `game.set_tick_period/exit/random/millis` + 回调 `on_start/on_tick/on_touch(evt,x,y)`; 文字走 lv_canvas layer + lv_draw_label(3参数)
 - **踩坑** (都 costly): ① espressif/lua 头文件**无 extern "C"**, C++ 里必须手动包; ② Lua 5.5 的 `lua_newstate` 多了第三参 `seed`; 组件按 `-DLUA_32BITS` 编译 (lua_Integer=int32); ③ **httpd 不能在板级构造期启动** —— lwip 未初始化, tcpip mbox 断言 → 启动循环 (无 panic 输出, 表现为静默循环); 推迟到 kDeviceStateIdle 再启; ④ 分区表改动要同步改 sdkconfig 缓存 (defaults 不覆盖已有值, 必要时删 sdkconfig 全量重配)
-- **网络故障根因复盘 (2026-10-25, 已修复)**: 局域网 ping 板子 100% 丢包、Mac 连不上 :8080, 一度误判为路由器 AP 隔离 (华为 AX3 主网络其实没有隔离开关, 且华为路由器**没有网页后台**, 只能用智慧生活 App 管理, 路由器管理地址打不开是正常的)。真因: **Application 在 idle 时把 WiFi 切到 LOW_POWER = WIFI_PS_MAX_MODEM** (wifi_station.cc SetPowerSaveLevel), 华为路由器对深睡设备的来向单播直接丢弃; 对话时临时升档所以语音正常。修复: 板级覆写 SetPowerSaveLevel 把 LOW_POWER 钳制到 BALANCED (MIN_MODEM), 实测 ping 40-200ms、安装页全流程 (上传/列表/删除) 通过。另: esp_http_server 通配路径要配 `config.uri_match_fn = httpd_uri_match_wildcard`
-
-
-### 8.6 三期(硬件开放): Lua 脚本硬件 API (2026-10-25, 全部板上实测)
-
-script_hw.h/cc — imu/camera/sound/i2c/gpio 五组 API 注册进沙箱。安全红线:
-- GPIO10/11 仅高阻只读 (电源保持线), 无任何写路径
-- I2C 写屏蔽板载地址 {0x18,0x19,0x38,0x3C,0x41,0x55}; 0x6A(IMU) 与外接可写
-- IMU: QMI8658 驱动移植自官方例程 (复位→**等15ms**→CTRL1/7/2/3, 每写间隔2ms)
-- 摄像头: Esp32Camera 加了 current_frame() 只读访问器 (上游文件, 2行),
-  snapshot 拍 QVGA RGB565 垂直居中裁剪到 320x200 直拷画布
-- 声音: 正弦发生器(24kHz, 5ms淡入淡出) → AudioCodec::OutputData 直写
-
-**本日四大坑 (全部实测代价)**:
-1. **I2C 必须 100kHz**: 400k 时扫描大量幻影 ACK (每次集合还不同)、IMU 数据错位
-   (±满量程垃圾) — 摄像头 DVP 高速翻转的干扰下信号完整性不足; 100k 完美干净
-   (扫描精确 7 设备)。i2c_master_probe 速率不可控, 扫描改用自建 100k 读探测
-2. **QMI8658 复位后必须延时再写配置**: 复位后连写 CTRL 会全部丢失 → 传感器
-   使能位没开 → 数据永远垃圾; 官方例程的 delay(10) 不能省
-3. **STATUS0 就绪位是读后清零**: 靠轮询它判数据会踩不中 4ms 节拍 (闲置后永远
-   nil); 解法=盲读 12 字节数据寄存器 (250Hz 持续出数, 永远有最新样本)
-4. **PCA9557 的 I2cDevice::ReadReg 是 ESP_ERROR_CHECK**: sound.beep→EnableOutput
-   →SetOutputState→ReadReg, I2C 瞬断直接 panic 重启整台 (板上 I2C 瞬断是常态,
-   电池驱动当年就为此写过 ReadRegSafe)。已把板内 Pca9557 类整体安全化
-   (重试3次+缓存回退), xiaozhi 自己的音频开关路径同时受益
-
-IMU 实测: 静置 acc=(-0.08, 0.00, 0.99)g (Z 轴重力, 物理正确), gyr 零偏个位数;
-闲置 60s+ 读数依旧即时; 三连 beep 无崩溃。
+- **网络故障根因复盘 (2026-10-25, 已修复)**: 局域网 ping 板子 100% 丢包、Mac 连不上 :8080, 一度误判为路由器 AP 隔离 (华为 AX3 主网络其实没有隔离开关, 且华为路由器**没有网页后台**, 只能用智慧生活 App 管理, 192.168.3.1 打不开是正常的)。真因: **Application 在 idle 时把 WiFi 切到 LOW_POWER = WIFI_PS_MAX_MODEM** (wifi_station.cc SetPowerSaveLevel), 华为路由器对深睡设备的来向单播直接丢弃; 对话时临时升档所以语音正常。修复: 板级覆写 SetPowerSaveLevel 把 LOW_POWER 钳制到 BALANCED (MIN_MODEM), 实测 ping 40-200ms、安装页全流程 (上传/列表/删除) 通过。另: esp_http_server 通配路径要配 `config.uri_match_fn = httpd_uri_match_wildcard`
 
 ### 8.5 烧录连接故障排查 (2026-10-25 实录)
 
@@ -293,3 +266,40 @@ esptool 反复 "No serial data received" (default-reset/usb-reset 均无效, 复
 - **OTA 防护**: 官方服务器启动时会比对版本并**自动 OTA** (`application.cc CheckNewVersion` → `UpgradeFirmware`, 还有 force=1 强推通道)。已把根 CMakeLists.txt 的 `PROJECT_VER` 抬到 **99.0.0**, 日志验证 "Current is the latest version"。每次 merge 上游后该行必冲突 (上游会改版本号), 解决时保留 99.0.0。
 - **代码托管**: 定制已提交到 `github.com/cailven/lichuang-cailven` (main 分支, 完整上游历史 + 定制 commit)。本地仓库 `origin` = 上游 (fetch 用, 走 gh-proxy 只读代理), `cailven` = 用户仓库 (push 用, **走 SSH**: 专用密钥 `~/.ssh/id_ed25519_github_cailven`, ssh config 已为 github.com 指定该密钥 + IdentitiesOnly; 用户账号级添加, `ssh -T` 显示 Hi cailven!。HTTPS 备用通道: ghfast.top 透传认证 — gh-proxy.com 会剥掉写路径认证 — 仓库留有调 `gh auth token` 的 credential helper, gh 登录账号 zhangrunqiu 对 cailven 仓库有 ADMIN 权限)。
 - **同步上游流程**: `git fetch origin` → 看 log → `git merge origin/main` → 解决冲突 (预计仅 lichuang_dev_board.cc / config.h / CMakeLists.txt ×2) → 重编译烧录回归。2026-10-25 曾因**浅克隆**推送失败 (index-pack), 已 `git fetch --unshallow` 补全历史。
+
+### 8.7 全功能现状与踩坑总表 (2026-10-26, 供后续 AI 接手)
+
+**当前固件全貌**: 小智 v2.5.3 + 类安卓游戏桌面。主程序只做三件事: 桌面 + 小智 + Lua 脚本引擎, 所有游戏 (含贪吃蛇) 都是 /apps 分区的 .lua。四界面模式: kChat/kDesktop/kGame/kSettings。功能: 横滚图标桌面 / Lua 沙箱 (canvas/game API + imu/camera/sound/i2c/gpio 硬件 API) / 局域网安装器 :8080 (上传/在线编辑/删除/装前校验) / 设置面板 (亮度音量滑条+重新配网+重启, 危险操作双击确认) / 界面静默 (进桌面游戏自动停语音关唤醒词) / 时钟等出厂脚本 / OTA 防护 99.0.0。
+
+**踩坑总表 (22 条, 按症状查)**:
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | esptool 连不上 "No serial data" | 原生 USB-JTAG 通路卡死 (电脑休眠后) | 拔插 USB 线 |
+| 2 | 静默重启循环, 无任何 panic 输出 | GPIO10/11 被拉低 (电池电源保持线断电) | 永远只高阻读, 禁任何输出 |
+| 3 | 启动中误进配网模式 | kDeviceStateStarting 时按 BOOT 是原生配网入口 | 观察日志时别碰键 |
+| 4 | I2C 扫描大量幻影 ACK / IMU 数据 ±满量程 | 400kHz 受摄像头 DVP 干扰信号完整性不足 | 全部 I2C 100kHz; 扫描弃 i2c_master_probe 改自建读探测 |
+| 5 | QMI8658 数据全是垃圾 | 复位后连写配置全部丢失 (官方例程的 delay 不能省) | 复位→等15ms→逐个写 CTRL (间隔2ms) |
+| 6 | IMU 闲置一段时间后永远 nil | STATUS0 就绪位读后清零, 短重试踩不中 4ms 节拍 | 盲读 12 字节数据寄存器 (250Hz 永远有数据) |
+| 7 | sound.beep 引发整机 panic | PCA9557 的 I2cDevice::ReadReg 是 ESP_ERROR_CHECK, I2C 瞬断即炸 | 板内 Pca9557 类安全化 (重试3次+缓存回退) |
+| 8 | 上传 ~4.7KB 脚本时整机重启 | httpd 任务栈 4K 跑不下 Lua 编译器 (栈溢出) | httpd 与 LVGL 任务栈都加到 16K; 桌面扫描加元信息缓存 (名字+大小) |
+| 9 | 摄像头画面"滤镜感" | fb 是大端 RGB565, LVGL 画布要小端 uint16, memcpy 字节颠倒 | 逐像素字节交换; camera.snapshot(hflip) 镜像参数; camera.rgb_swap 纠通道序 |
+| 10 | 设置里点"重新配网"闪退 | 双 httpd 实例 ctrl_port 默认都是 32768, 配网服务 httpd_start 失败被它的 ESP_ERROR_CHECK 引爆 | 安装器 ctrl_port 改 32769 (wifi_configuration_ap.cc:232) |
+| 11 | 开机偶发崩溃, 桌面 2.5s 就出现 | 触摸屏上电幽灵触摸击中"主页"按钮, 初始化中途切屏竞态 | kDeviceStateStarting 期间锁定界面切换 |
+| 12 | 局域网 ping 板子 100% 丢包 (能上网/语音正常) | 小智 idle 切 WIFI_PS_MAX_MODEM 深睡, 华为路由器丢弃沉睡设备来向单播 | 板级覆写 SetPowerSaveLevel 把 LOW_POWER 钳制到 BALANCED |
+| 13 | 增删板级 .cc 后链接报错/找不到文件 | CMake glob 增量编译不重扫 | idf.py reconfigure 再 build (build.py 自带) |
+| 14 | Lua 函数链接错误 (C++ 修饰名) | espressif/lua 头文件无 extern "C" 保护 | #include 外包 extern "C" {} |
+| 15 | lua_newstate 参数不对 / 大整数溢出 | espressif/lua 是 Lua 5.5: lua_newstate 多第三参 seed; 编译带 -DLUA_32BITS (lua_Integer=int32, 色值<2^24 安全) | 按 5.5 API 写; 大数避开 |
+| 16 | httpd 在板级构造期启动 → 启动循环 | lwip 未初始化, tcpip mbox 断言 | 推迟到 kDeviceStateIdle 再启动 |
+| 17 | 时钟开机显示 1970 | 小智联网校时前的窗口期系统时间无效 | 脚本判 年份<2024 显示"时间同步中", 校准后每秒 tick 自动恢复 |
+| 18 | 设置按钮变纯色块 | 按钮标签没套主题字体, LVGL 默认字体无中文字形 | 所有自建文字统一 SafeThemeFont + PickText 中英回退 |
+| 19 | 设置界面文字重叠 | 绝对坐标排布拥挤 | 竖向滚动 flex 容器布局 |
+| 20 | push 报 index-pack failed | 仓库是浅克隆, 历史对象不全 | git fetch origin --unshallow |
+| 21 | git push 认证失败 (gh-proxy) | gh-proxy 剥掉写路径认证 | 走 ghfast.top 或 SSH (密钥 id_ed25519_github_cailven) |
+| 22 | 电脑浏览器打不开板子网页 (curl 正常) | Mac 的 Astrill 系统代理截走局域网流量 | 代理直连列表加 192.168.0.0/16 (Astrill 切换可能重置) |
+
+**字体体系**: 内置中文字体只含小智 UI 子集; 服务器联网后推送全量字体并**释放旧字体对象** —— 自建 LVGL 标签必须在每次显示时重取主题字体 (SafeThemeFont), 否则悬挂崩溃; 中英文用 PickText 按字形覆盖自动回退。
+
+**蓝牙**: xiaozhi 基线未编译 (CONFIG_BT_ENABLED off)。仓库自带 BluFi 蓝牙配网完整实现 (CONFIG_USE_ESP_BLUFI_WIFI_PROVISIONING, blufi.cpp), 但与热点网页配网互斥, 默认保持网页配网。
+
+**危险操作双确认**: 重新配网/重启等破坏性按钮必须 3 秒内点两次 (首点变"再点一次确认")。
