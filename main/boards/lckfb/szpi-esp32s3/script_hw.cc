@@ -44,6 +44,7 @@ AudioCodec* ScriptHardware::codec_ = nullptr;
 bool ScriptHardware::imu_ok_ = false;
 bool ScriptHardware::imu_tried_ = false;
 int ScriptHardware::imu_stall_count_ = 0;
+bool ScriptHardware::rgb_swap_ = false;
 
 void ScriptHardware::Init(i2c_master_bus_handle_t bus, Esp32Camera* camera, AudioCodec* codec) {
     bus_ = bus;
@@ -147,7 +148,9 @@ int ScriptHardware::LuaImuRead(lua_State* L) {
 }
 
 // ===== 摄像头: 拍一帧并居中裁剪画进游戏画布 (320x240 → 320x200) =====
+// 可选参数: camera.snapshot(hflip) — true = 水平镜像 (做镜子用)
 int ScriptHardware::LuaCameraSnapshot(lua_State* L) {
+    bool hflip = lua_toboolean(L, 1);
     if (camera_ == nullptr) {
         lua_pushboolean(L, 0);
         return 1;
@@ -162,14 +165,33 @@ int ScriptHardware::LuaCameraSnapshot(lua_State* L) {
     if (app == nullptr || fb == nullptr || fb->width < 320 || fb->height < 200) {
         return 1;  // 无画布 (如元信息预读) 时仅返回拍照结果
     }
-    // RGB565 逐行拷贝, 垂直居中裁掉上下各 (h-200)/2 行
+    // 逐像素拷贝: fb 是大端 RGB565 (DVP 总线原生序), LVGL 画布要小端 uint16,
+    // 直接 memcpy 会红绿蓝错乱 ("滤镜感"); 可选水平镜像 + 红蓝通道交换
     uint16_t* dst = app->canvas_buffer();
     const uint16_t* src = (const uint16_t*)fb->buf;
     int top = (fb->height - 200) / 2;
     for (int row = 0; row < 200; row++) {
-        memcpy(dst + row * 320, src + (top + row) * fb->width, 320 * sizeof(uint16_t));
+        const uint16_t* srow = src + (top + row) * fb->width;
+        uint16_t* drow = dst + row * 320;
+        for (int col = 0; col < 320; col++) {
+            uint16_t v = srow[hflip ? (319 - col) : col];
+            v = (uint16_t)((v >> 8) | (v << 8));  // 大端 → 小端
+            if (rgb_swap_) {
+                v = (uint16_t)((v & 0x07E0) | ((v & 0xF800) >> 11) | ((v & 0x001F) << 11));
+            }
+            drow[col] = v;
+        }
     }
     app->InvalidateCanvas();
+    return 1;
+}
+
+// 颜色仍不对 (红蓝颠倒) 时: camera.rgb_swap(true)
+int ScriptHardware::LuaCameraRgbSwap(lua_State* L) {
+    if (lua_gettop(L) >= 1) {
+        rgb_swap_ = lua_toboolean(L, 1) != 0;
+    }
+    lua_pushboolean(L, rgb_swap_);
     return 1;
 }
 
@@ -318,6 +340,8 @@ void ScriptHardware::RegisterApi(lua_State* L) {
     lua_newtable(L);
     lua_pushcfunction(L, LuaCameraSnapshot);
     lua_setfield(L, -2, "snapshot");
+    lua_pushcfunction(L, LuaCameraRgbSwap);
+    lua_setfield(L, -2, "rgb_swap");
     lua_setglobal(L, "camera");
 
     lua_newtable(L);

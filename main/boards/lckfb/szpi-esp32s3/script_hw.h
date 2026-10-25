@@ -31,6 +31,7 @@ private:
     // --- Lua 绑定 ---
     static int LuaImuRead(lua_State* L);
     static int LuaCameraSnapshot(lua_State* L);
+    static int LuaCameraRgbSwap(lua_State* L);
     static int LuaSoundBeep(lua_State* L);
     static int LuaI2cRead(lua_State* L);
     static int LuaI2cWrite(lua_State* L);
@@ -48,4 +49,5 @@ private:
     static bool imu_ok_;
     static bool imu_tried_;
     static int imu_stall_count_;
+    static bool rgb_swap_;  // 摄像头红蓝通道交换 (传感器通道序差异时用)
 };
